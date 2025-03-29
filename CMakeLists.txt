@@ -2,6 +2,7 @@
 ## CMakeLists.txt --- gsModule
 ## This file is part of the G+Smo library.
 ##
+## Author: H. Honnerova
 ######################################################################
 
 ## gsPetsc module
@@ -20,6 +21,11 @@ if( (NOT GISMO_BUILD_LIB) )
   endif()
 endif()
 
+if(NOT GISMO_WITH_MPI)
+  message(WARNING "Please enable MPI by setting -D GISMO_WITH_MPI=ON in order to use PETSc")
+endif(NOT GISMO_WITH_MPI)
+
+execute_process( COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/FindPETSc.cmake ${CMAKE_SOURCE_DIR}/cmake/)
 find_package(PETSc REQUIRED)
 
 # Add object library
@@ -44,6 +50,14 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}"
   DESTINATION include/gismo
   FILES_MATCHING PATTERN "*.h" )
 
+# Include directory
+set (GISMO_INCLUDE_DIRS ${GISMO_INCLUDE_DIRS} ${PETSC_INCLUDES}
+  CACHE INTERNAL "Gismo include directories" PARENT_SCOPE)
+
+# Linker
+set(gismo_LINKER ${gismo_LINKER} ${PETSC_LIBRARY}
+  CACHE INTERNAL "${PROJECT_NAME} extra linker objects" FORCE)
+  
 # add example files
 aux_cpp_directory(${CMAKE_CURRENT_SOURCE_DIR}/examples FILES)
 foreach(file ${FILES})
