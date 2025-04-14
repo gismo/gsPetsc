@@ -8,7 +8,7 @@
     License, v. 2.0. If a copy of the MPL was not distributed with this
     file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-    Author(s): P. Weinmueller
+    Author(s):
 */
 
 //! [Include namespace]
@@ -48,11 +48,8 @@ int main(int argc, char *argv[])
     if (0==_rank)
         gsInfo<<"Running on "<<_size<<" processes.\n";
 
-    PetscCall( PetscInitialize(&argc, &argv, (char *)0, ""));
-    
     gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver;
-//    solver.compute(Q, comm);
-    solver.compute(Q, PETSC_COMM_WORLD);
+    solver.compute(Q, comm);
     x = solver.solve(b);
 
     gsInfo <<"Solution: "<< x.transpose() <<"\n";
