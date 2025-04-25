@@ -150,7 +150,7 @@ void petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petsc
     }
     else
     {
-        GISMO_ASSERT(localRows == gismoMat.rows(), "petsc_copySparseMat: Incompatible number of petscMat local rows and gismoMat rows.");
+        //GISMO_ASSERT(localRows == gismoMat.rows(), "petsc_copySparseMat: Incompatible number of petscMat local rows and gismoMat rows.");
         petsc_preallocMPI(gismoMat, petscMat, localCols, globStartCol);
     }
 
@@ -160,7 +160,7 @@ void petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petsc
     const int* innerIndex = gismoMat.innerIndexPtr();
     const double* values = gismoMat.valuePtr();
 
-    for (int i = 0; i < gismoMat.rows(); i++)
+    for (int i = 0; i < localRows; i++)
     {
         int indi[1];
         indi[0] = globStartRow + i;
@@ -188,6 +188,66 @@ MatCreateMPIAIJWithArrays(comm, m, n, M, N, i, j, a, &A);  // i, j, a must stay 
     PetscCallVoid( MatAssemblyBegin( petscMat, MAT_FINAL_ASSEMBLY ) );
     PetscCallVoid( MatAssemblyEnd( petscMat, MAT_FINAL_ASSEMBLY ) ); 
 }
+
+// template<class T>
+// void petsc_copyLocalSparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat,
+//                                 const index_t localRows, const index_t localCols,
+//                          const index_t globStartRow, const index_t globStartCol, MPI_Comm comm)
+// {
+//     int M = 0; // global number of rows
+//     int N = 0; // global number of columns
+//     PetscCallVoid( MatGetSize(petscMat, &M, &N) );
+//     GISMO_ASSERT(M*N > 0, "petsc_copyLocalSparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
+
+//     int nProc = -1;
+//     MPI_Comm_size( comm, &nProc );
+
+//     // preallocate PETSc matrix
+//     if (nProc == 1)
+//     {
+//         GISMO_ASSERT(M == gismoMat.rows() && N == gismoMat.cols(), "petsc_copyLocalSparseMat: Incompatible petscMat and gismoMat sizes.");
+//         petsc_preallocSeq(gismoMat, petscMat);
+//     }
+//     else
+//     {
+//         GISMO_ASSERT(localRows == gismoMat.rows(), "petsc_copyLocalSparseMat: Incompatible number of petscMat local rows and gismoMat rows.");
+//         petsc_preallocMPI(gismoMat, petscMat, localCols, globStartCol);
+//     }
+
+//     // copy values
+
+//     const int* outerIndex = gismoMat.outerIndexPtr();
+//     const int* innerIndex = gismoMat.innerIndexPtr();
+//     const double* values = gismoMat.valuePtr();
+
+//     for (int i = 0; i < gismoMat.rows(); i++)
+//     {
+//         int indi[1];
+//         indi[0] = globStartRow + i;
+
+//         int j =  outerIndex[i];
+
+//         // PetscCopyMode
+//         // PETSC_COPY_VALUES , or : ETSC_USE_POINTER 
+//         PetscCallVoid( MatSetValues(petscMat, 1, indi, outerIndex[i+1] - outerIndex[i], &innerIndex[j], &values[j], INSERT_VALUES) );
+//     }
+
+//     /*
+// / Suppose you have m rows on this process and know the global size (M x N)
+// MatCreate(comm, &A);
+// MatSetSizes(A, m, n, M, N);
+// MatSetType(A, MATMPIAIJ);
+// // i: row pointers, j: column indices, a: values
+// // These should be filled before the call
+// MatMPIAIJSetPreallocationCSR(A, i, j, a);  // uses PETSC_COPY_VALUES by default
+// // But you can use MatCreateMPIAIJWithArrays if you want PETSC_USE_POINTER behavior:
+// MatCreateMPIAIJWithArrays(comm, m, n, M, N, i, j, a, &A);  // i, j, a must stay valid
+// // PETSC_USE_POINTER is implied: PETSc won't copy data, just uses your pointers
+//      */
+
+//     PetscCallVoid( MatAssemblyBegin( petscMat, MAT_FINAL_ASSEMBLY ) );
+//     PetscCallVoid( MatAssemblyEnd( petscMat, MAT_FINAL_ASSEMBLY ) ); 
+// }
 
 
 // gismoVec is assumed to be only the local part (number of rows = localRows)
@@ -228,14 +288,18 @@ void petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, 
 }
 
 
-// gismoVec is assumed to be only the local part (number of rows = localRows)
+// gismoVec is the global vector
 template<typename Derived>  
 void petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm)
 {
-    index_t nrows = gismoVec.rows();
+    //index_t nrows = gismoVec.rows();
+
     int M = 0; // global number of rows
     PetscCallVoid( VecGetSize(petscVec, &M) );
-    GISMO_ASSERT(M == nrows, "petsc_copyVecToGismo: Incompatible petscVec and gismoVec sizes.");
+    gismoVec.derived().resize(M, 1);
+    // GISMO_ASSERT(M == nrows, "petsc_copyVecToGismo: Incompatible petscVec and gismoVec sizes.");
+
+    // gsDebugVar(M);
 
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
@@ -249,17 +313,25 @@ void petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gis
 
     PetscCallVoid( VecScatterDestroy(&scatterCtx) );
 
-    index_t rowIDs[nrows];
-    for(index_t i = 0; i < nrows; i++)
+    index_t localDofs, globalStart;
+    gismo::petsc_computeMatLayout(M, &localDofs, &globalStart, comm);
+
+    // gsDebugVar(globalStart);
+
+    index_t rowIDs[M];
+    for(index_t i = 0; i < M; i++)
         rowIDs[i] = i;
 
-    real_t vals[nrows];
+    real_t* vals;
+    VecGetArray(globalVec, &vals);
 
-    PetscCallVoid( VecGetValues(globalVec, nrows, rowIDs, vals) );
+    for(index_t i = 0; i < M; i++)
+        gismoVec(i) = vals[i];
+
+    // PetscCallVoid( VecGetValues(globalVec, M, rowIDs, gismoVec.derived().data()) );
     PetscCallVoid( VecDestroy(&globalVec) );
 
-    for(index_t i = 0; i < nrows; i++)
-        gismoVec(i) = vals[i];
+    
 }
 
 }
@@ -351,7 +423,25 @@ public:
       return m_info;
     }
 
+    void initialize(MPI_Comm comm = PETSC_COMM_WORLD)
+    {
+        m_comm = comm;
+        PetscErrorCode err;
+
+        PETSC_COMM_WORLD = comm;
+        err = PetscInitializeNoArguments();
+        assert(0==err);
+    }
+
     Derived& compute(const MatrixType& matrix, MPI_Comm comm = PETSC_COMM_WORLD);
+
+    std::pair<index_t, index_t> computeLayout(index_t nRows, MPI_Comm comm = PETSC_COMM_WORLD)
+    {
+        index_t localDofs, globalStart;
+        gismo::petsc_computeMatLayout(nRows, &localDofs, &globalStart, m_comm);
+        
+        return std::make_pair(localDofs, globalStart);
+    }
     
     template<typename Rhs,typename Dest>
     void _solve_impl(const MatrixBase<Rhs> &b, MatrixBase<Dest> &dest) const;
@@ -379,14 +469,14 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
 {
-    m_comm = comm;
+    // m_comm = comm;
     PetscErrorCode err;
 
-    PETSC_COMM_WORLD = comm;
-    err = PetscInitializeNoArguments();
-    assert(0==err);
+    // PETSC_COMM_WORLD = comm;
+    // err = PetscInitializeNoArguments();
+    // assert(0==err);
     
-    m_size = matrix.rows();
+    // m_size = matrix.rows();
     int nProc = -1;
     int rank  = -1;
 
@@ -403,6 +493,8 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
 
     index_t localDofs, globalStart;
     gismo::petsc_computeMatLayout(nRows, &localDofs, &globalStart, m_comm);
+    
+    m_size = localDofs;
 
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
     gismo::petsc_copySparseMat(matrix, m_pmatrix, localDofs, localDofs, globalStart, globalStart, m_comm);
