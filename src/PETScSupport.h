@@ -200,6 +200,7 @@ void petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, 
 
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
+    //int nProc = 1;
 
     index_t nrows = gismoVec.rows();
 
@@ -315,7 +316,7 @@ public:
     mutable KSP ksp; // krylov solver
     mutable PC pc; // preconditionner
 
-    MPI_Comm * m_comm;
+    MPI_Comm m_comm;
     
 // ----------- start PETSc
     Mat m_pmatrix;      ///< PETSc matrix
@@ -378,7 +379,7 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
 {
-    m_comm = &comm;
+    m_comm = comm;
     PetscErrorCode err;
 
     PETSC_COMM_WORLD = comm;
@@ -389,22 +390,22 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
     int nProc = -1;
     int rank  = -1;
 
-    MPI_Comm_size( *m_comm, &nProc );
-    MPI_Comm_rank( *m_comm, &rank );
+    MPI_Comm_size( m_comm, &nProc );
+    MPI_Comm_rank( m_comm, &rank );
 
     index_t nRows = matrix.rows();
     index_t nCols = matrix.cols();
     assert(nRows==nCols && "expecting square mat");
 
-    gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, *m_comm);
+    gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, m_comm);
     err = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
     assert(0==err);
 
     index_t localDofs, globalStart;
-    gismo::petsc_computeMatLayout(nRows, &localDofs, &globalStart, *m_comm);
+    gismo::petsc_computeMatLayout(nRows, &localDofs, &globalStart, m_comm);
 
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
-    gismo::petsc_copySparseMat(matrix, m_pmatrix, localDofs, localDofs, globalStart, globalStart, *m_comm);
+    gismo::petsc_copySparseMat(matrix, m_pmatrix, localDofs, localDofs, globalStart, globalStart, m_comm);
 
     //err = PetscFinalize(); //segfault!
     //assert(0==err);
@@ -423,10 +424,10 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     assert(((MatrixBase<XDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major matrices of unknowns are not supported");
     assert(((nrhs == 1) || b.outerStride() == b.rows()));
 
-    gismo::petsc_copyVec(b, m_prhs, *m_comm);
+    gismo::petsc_copyVec(b, m_prhs, m_comm);
 
     PetscErrorCode err;
-    err = KSPCreate(*m_comm, &ksp);
+    err = KSPCreate(m_comm, &ksp);
     assert(0==err);
     // setupSolver(ksp);
     err = KSPGetPC(ksp, &pc);
@@ -443,10 +444,10 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     int nIter = 0;
     err = KSPGetIterationNumber(this->ksp, &nIter);
     assert(0==err);
-    gismo::petsc_copyVecToGismo(m_psol, x, *m_comm);
+    gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
 
     // clearing petsc matrices and vectors
-    //MPI_Barrier(*m_comm); // probably barrier not needed
+    //MPI_Barrier(m_comm); // probably barrier not needed
     err = VecZeroEntries(m_prhs);
     assert(0==err);
 }
