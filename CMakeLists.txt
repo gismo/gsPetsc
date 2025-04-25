@@ -52,7 +52,9 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}"
 
 # Include directory
 set (GISMO_INCLUDE_DIRS ${GISMO_INCLUDE_DIRS} ${PETSC_INCLUDES}
-  CACHE INTERNAL "Gismo include directories" PARENT_SCOPE)
+  CACHE INTERNAL "Gismo include directories" FORCE)
+  
+include_directories(${GISMO_INCLUDE_DIRS})
 
 # Linker
 set(gismo_LINKER ${gismo_LINKER} ${PETSC_LIBRARY}
