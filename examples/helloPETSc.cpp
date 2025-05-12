@@ -20,39 +20,50 @@ using namespace gismo;
 
 int main(int argc, char *argv[])
 {
+    // Initialize the MPI environment
+    const gsMpi & mpi = gsMpi::init(argc, argv);
 
-    gsInfo << "Hello PETSc!\n";
+    // Get the world communicator
+    gsMpiComm comm = mpi.worldComm();
+    
+    //Get size and rank of the processor
+    int _rank = comm.rank();
+    int _size = comm.size();
+
+    if (0==_rank)
+    {
+        gsInfo << "Hello PETSc!\n";
+        gsInfo<<"Running on "<<_size<<" processes.\n";
+    }
+
+    // PetscInitialize(&argc, &argv, (char *)0, "");
+
+    gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver;
+    solver.initialize(comm);
 
     index_t mat_size = 10;
 
+    auto localGlobal = solver.computeLayout(mat_size, comm);
+
     // Create a linear system
     gsSparseMatrix<real_t, RowMajor>  Q(mat_size,mat_size);
-    gsMatrix<>        b(mat_size,1), x(mat_size,1), x0(mat_size,1);
-    x0.setOnes();
+    gsMatrix<>        b(localGlobal.first,1), x;
+
     Q.reserve( gsVector<int>::Constant(mat_size,1) ); // Reserve memory for 1 non-zero entry per column
-    for (index_t i = 0; i!=mat_size; ++i)
-        Q(i,i) = b.at(i) = i+1;
-    
+    for (index_t i = 0; i!=localGlobal.first; ++i)
+    {
+        Q(i + localGlobal.second, i + localGlobal.second) = 1.0;
+        b(i) = i+localGlobal.second+1;
+    }
+
     Q.makeCompressed(); // always call makeCompressed after sparse matrix has been filled
 
-    // PETSc here
-
-    // Initialize the MPI environment
-    const gsMpi & mpi = gsMpi::init(argc, argv);
-    // Get the world communicator
-    gsMpiComm comm = mpi.worldComm();
-    int _rank = comm.rank();
-
-    //Get size and rank of the processor
-    int _size = comm.size();
-    if (0==_rank)
-        gsInfo<<"Running on "<<_size<<" processes.\n";
-
-    gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver;
     solver.compute(Q, comm);
     x = solver.solve(b);
 
-    gsInfo <<"Solution: "<< x.transpose() <<"\n";
-    
+    if (0==_rank)
+        gsInfo <<"Solution: "<< x.transpose() <<"\n";
+
+    //PetscFinalize();
     return EXIT_SUCCESS;
 }
