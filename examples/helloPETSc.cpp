@@ -43,7 +43,7 @@ int main(int argc, char *argv[])
 {
     // Size of global sparse matrix
     index_t mat_size = 10;
-    std::string slv;
+    std::string slv("gmres");
 
     gsCmdLine cmd("Testing the use of sparse linear solvers.");
     cmd.addInt("n", "size", "Size of the matrices", mat_size);
@@ -96,7 +96,7 @@ int main(int argc, char *argv[])
 
     solver.print();
 
-    if (0==_rank)
+    if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
 
     //PetscFinalize();
