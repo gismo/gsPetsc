@@ -21,13 +21,33 @@
 using namespace gismo;
 //! [Include namespace]
 
+
+gsOptionList setOptions(std::string slv)
+{
+    gsOptionList result;
+    if (slv == "gmres")
+    {
+        result.addString("-ksp_type", "Type of Krylov solver", "fgmres");
+        result.addString("-ksp_initial_guess_nonzero", "", "true");
+        result.addString("-pc_type", "", "jacobi");
+    }
+
+    // if...
+    
+    return result;
+}
+
+
+
 int main(int argc, char *argv[])
 {
     // Size of global sparse matrix
     index_t mat_size = 10;
+    std::string slv;
 
     gsCmdLine cmd("Testing the use of sparse linear solvers.");
     cmd.addInt("n", "size", "Size of the matrices", mat_size);
+    cmd.addString("s", "setup", "Setup options for PETSc", slv);
 
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
 
@@ -53,6 +73,10 @@ int main(int argc, char *argv[])
     // Get local size and offset for the node
     std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
 
+    solver.options() = setOptions(slv);
+    if (0==_rank)
+        gsInfo << solver.options() <<"\n";
+
     // Assemble the linear system
     // Each node fills in their local part of the matrix (a set of rows)
     // On a sparse matrix of global size
@@ -69,6 +93,8 @@ int main(int argc, char *argv[])
 
     solver.compute(Q);
     x = solver.solve(b);
+
+    solver.print();
 
     if (0==_rank)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";

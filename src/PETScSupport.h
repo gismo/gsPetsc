@@ -276,14 +276,13 @@ public:
         MaxColsAtCompileTime = Dynamic
     };
 
-    mutable KSP m_ksp; // krylov solver
-    mutable PC m_pc; // preconditionner
+    gismo::gsOptionList m_options;     ///< Options
 
-    MPI_Comm m_comm;
-    index_t m_localSize; // number of local rows
-    index_t m_globalStart; // index of the first local row in the global matrix
+    mutable KSP m_ksp; ///< krylov solver
+    mutable PC m_pc;   ///< preconditionner
+
+    MPI_Comm m_comm; ///< communicator
     
-// ----------- start PETSc
     Mat m_pmatrix;      ///< PETSc matrix
     mutable Vec m_prhs, m_psol; ///< Solution vector and right-hand side vector
 
@@ -327,10 +326,13 @@ public:
         // Create KSP (Krylov Subspace Preconditioned) solver
         err = KSPCreate(m_comm, &m_ksp);
         assert(0==err);
+
         // Get the preconditionner
         err = KSPGetPC(m_ksp, &m_pc);
         assert(0==err);
     }
+
+    gismo::gsOptionList & options() {return m_options;}
 
     inline Index cols() const { return m_size; }
     inline Index rows() const { return m_size; }
@@ -345,6 +347,12 @@ public:
       return m_info;
     }
 
+    /// Prints details about this solver
+    void print() const
+    {
+        PetscOptionsView(NULL, PETSC_VIEWER_STDOUT_(m_comm));
+    }
+    
     /// Copies the \a matrix to a PETSc matrix
     Derived& compute(const MatrixType& matrix);
 
@@ -364,6 +372,39 @@ public:
     void _solve_impl(const MatrixBase<Rhs> &b, MatrixBase<Dest> &dest) const;
 
 protected:
+
+    void applyOptions() const
+    {
+        PetscErrorCode err;
+        err = PetscOptionsClear(NULL);
+        for ( auto & opt : m_options.getAllEntries() )
+        {
+            err = PetscOptionsSetValue(NULL, opt.label.c_str(), opt.val.c_str());
+            assert(0==err);
+        }
+
+        err = KSPSetFromOptions(this->m_ksp);
+        assert(0==err);
+        err = PCSetFromOptions(this->m_pc);
+        assert(0==err);
+
+        // this is for systems with two fields...
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_type", "fieldsplit") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_detect_saddle_point", NULL) );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_type", "schur") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_schur_fact_type", "upper") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_schur_precondition", "self") );
+
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_ksp_type", "preonly") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_pc_type", "lu") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_pc_factor_mat_solver_type", "mumps") );
+
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_pc_type", "lsc") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_pc_lsc_scale_diag", NULL) );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_ksp_type", "preonly") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_pc_type", "lu") );
+        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_pc_factor_mat_solver_type", "mumps") );
+    }
 
     void manageErrorCode(Index error) const
     {
@@ -397,16 +438,19 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
     index_t nCols = matrix.cols();
     assert(nRows==nCols && "expecting square mat");
 
-    gismo::petsc_computeMatLayout(nRows, m_localSize, m_globalStart, m_comm);
+    index_t localSize; // number of local rows
+    index_t globalStart; // index of the first local row in the global matrix
+    
+    gismo::petsc_computeMatLayout(nRows, localSize, globalStart, m_comm);
 
     gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, m_comm);
     err = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
     assert(0==err);
-    
-    m_size = m_localSize;
+
+    m_size = localSize;
 
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
-    gismo::petsc_copySparseMat(matrix, m_pmatrix, m_localSize, m_localSize, m_globalStart, m_globalStart, m_comm);
+    gismo::petsc_copySparseMat(matrix, m_pmatrix, localSize, localSize, globalStart, globalStart, m_comm);
 
     m_isInitialized = true;
     return this->derived();
@@ -425,15 +469,14 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     // Copy right-hand side vector to PETSc
     gismo::petsc_copyVec(b, m_prhs, m_comm);
 
+    this->applyOptions();
+
     PetscErrorCode err;
 
     // KSP set operators:
     // first: operator m_pmatrix, second: preconditionner build from the same matrix
     err = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
     assert(0==err);
-
-    // Set options (required)
-    static_cast<const Derived&>(*this).setDefaultOptions();
 
     // Solve the system
     err = KSPSolve(this->m_ksp, m_prhs, m_psol);
@@ -459,6 +502,7 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
   protected:
     typedef PetscImpl<PetscKSP> Base;
 
+    using Base::m_options;
     using Base::m_pmatrix;
     using Base::m_prhs;
     using Base::m_psol;
@@ -466,42 +510,7 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
     friend class PetscImpl< PetscKSP<MatrixType> >;
 
   public:
-    
-    void setDefaultOptions() const
-    {
-        PetscErrorCode err;
-        //(!) clear all CMD given options and reset to the ones that appear here
-        err = PetscOptionsClear(NULL);
-        err = PetscOptionsSetValue(NULL, "-ksp_type", "fgmres");
-        err = PetscOptionsSetValue(NULL, "-ksp_initial_guess_nonzero", "true");
-        err = PetscOptionsSetValue(NULL, "-pc_type", "jacobi");
 
-        err = KSPSetFromOptions(this->m_ksp);
-        assert(0==err);
-        err = PCSetFromOptions(this->m_pc);
-        assert(0==err);
-
-        //PetscOptionsView()
-
-        // this is for systems with two fields...
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_type", "fieldsplit") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_detect_saddle_point", NULL) );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_type", "schur") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_schur_fact_type", "upper") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_fieldsplit_schur_precondition", "self") );
-
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_ksp_type", "preonly") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_pc_type", "lu") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_0_pc_factor_mat_solver_type", "mumps") );
-
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_pc_type", "lsc") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_pc_lsc_scale_diag", NULL) );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_ksp_type", "preonly") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_pc_type", "lu") );
-        // PetscCallVoid( PetscOptionsSetValue(NULL, "-fieldsplit_1_lsc_pc_factor_mat_solver_type", "mumps") );
-    }
-
-    
     typedef typename Base::Scalar Scalar;
     typedef typename Base::RealScalar RealScalar;
 
