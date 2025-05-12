@@ -8,7 +8,10 @@
     License, v. 2.0. If a copy of the MPL was not distributed with this
     file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-    Author(s):
+    Author(s): H. Honnerova, A. Mantzaflaris
+
+    Example run: 
+    mpirun -np 6 ./bin/helloPETSc -n 2000
 */
 
 //! [Include namespace]

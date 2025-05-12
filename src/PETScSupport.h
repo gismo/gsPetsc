@@ -276,8 +276,8 @@ public:
         MaxColsAtCompileTime = Dynamic
     };
 
-    mutable KSP ksp; // krylov solver
-    mutable PC pc; // preconditionner
+    mutable KSP m_ksp; // krylov solver
+    mutable PC m_pc; // preconditionner
 
     MPI_Comm m_comm;
     index_t m_localSize; // number of local rows
@@ -305,7 +305,10 @@ public:
         assert(0==err);
         err = VecDestroy(&m_prhs);
         assert(0==err);
-
+        err = KSPDestroy(&m_ksp);
+        assert(0==err);
+        //err = PCDestroy(&m_pc); //managed by m_ksp
+        //assert(0==err);
         PetscFinalize();
     }
 
@@ -320,6 +323,13 @@ public:
         assert(0==err);
         // Note: initialization with command line arguments is done as follows:
         // PetscInitialize(&argc, &argv, (char *)0, "");
+
+        // Create KSP (Krylov Subspace Preconditioned) solver
+        err = KSPCreate(m_comm, &m_ksp);
+        assert(0==err);
+        // Get the preconditionner
+        err = KSPGetPC(m_ksp, &m_pc);
+        assert(0==err);
     }
 
     inline Index cols() const { return m_size; }
@@ -416,28 +426,22 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     gismo::petsc_copyVec(b, m_prhs, m_comm);
 
     PetscErrorCode err;
-    // Create KSP (Krylov Subspace Preconditioned) solver
-    err = KSPCreate(m_comm, &ksp);
-    assert(0==err);
-    // Get the preconditionner
-    err = KSPGetPC(ksp, &pc);
-    assert(0==err);
 
     // KSP set operators:
     // first: operator m_pmatrix, second: preconditionner build from the same matrix
-    err = KSPSetOperators(this->ksp, m_pmatrix, m_pmatrix);
+    err = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
     assert(0==err);
 
     // Set options (required)
     static_cast<const Derived&>(*this).setDefaultOptions();
 
     // Solve the system
-    err = KSPSolve(this->ksp, m_prhs, m_psol);
+    err = KSPSolve(this->m_ksp, m_prhs, m_psol);
     assert(0==err);
 
     // Get statistics
     int nIter = 0;
-    err = KSPGetIterationNumber(this->ksp, &nIter);
+    err = KSPGetIterationNumber(this->m_ksp, &nIter);
     assert(0==err);
 
     // Copy the solution back to \a x
@@ -472,9 +476,9 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
         err = PetscOptionsSetValue(NULL, "-ksp_initial_guess_nonzero", "true");
         err = PetscOptionsSetValue(NULL, "-pc_type", "jacobi");
 
-        err = KSPSetFromOptions(this->ksp);
+        err = KSPSetFromOptions(this->m_ksp);
         assert(0==err);
-        err = PCSetFromOptions(this->pc);
+        err = PCSetFromOptions(this->m_pc);
         assert(0==err);
 
         //PetscOptionsView()
