@@ -20,6 +20,14 @@ using namespace gismo;
 
 int main(int argc, char *argv[])
 {
+    // Size of global sparse matrix
+    index_t mat_size = 10;
+
+    gsCmdLine cmd("Testing the use of sparse linear solvers.");
+    cmd.addInt("n", "size", "Size of the matrices", mat_size);
+
+    try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
+
     // Initialize the MPI environment
     const gsMpi & mpi = gsMpi::init(argc, argv);
 
@@ -36,16 +44,15 @@ int main(int argc, char *argv[])
         gsInfo<<"Running on "<<_size<<" processes.\n";
     }
 
-    // PetscInitialize(&argc, &argv, (char *)0, "");
+    // Initialize PETSc solver with the desired communicator
+    gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
 
-    gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver;
-    solver.initialize(comm);
+    // Get local size and offset for the node
+    std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
 
-    index_t mat_size = 10;
-
-    auto localGlobal = solver.computeLayout(mat_size, comm);
-
-    // Create a linear system
+    // Assemble the linear system
+    // Each node fills in their local part of the matrix (a set of rows)
+    // On a sparse matrix of global size
     gsSparseMatrix<real_t, RowMajor>  Q(mat_size,mat_size);
     gsMatrix<>        b(localGlobal.first,1), x;
 
@@ -55,10 +62,9 @@ int main(int argc, char *argv[])
         Q(i + localGlobal.second, i + localGlobal.second) = 1.0;
         b(i) = i+localGlobal.second+1;
     }
-
     Q.makeCompressed(); // always call makeCompressed after sparse matrix has been filled
 
-    solver.compute(Q, comm);
+    solver.compute(Q);
     x = solver.solve(b);
 
     if (0==_rank)

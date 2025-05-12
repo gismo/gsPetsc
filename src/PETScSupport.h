@@ -290,7 +290,11 @@ public:
     mutable ComputationInfo m_info;
     Index m_size;
 
-    PetscImpl() : m_size(-1) { m_isInitialized = false; }
+    PetscImpl(MPI_Comm comm = PETSC_COMM_WORLD) : m_size(-1)
+    {
+        initialize(comm);
+        m_isInitialized = false;// Becomes true when the sparse matrix is given
+    }
 
     ~PetscImpl()
     {
@@ -303,6 +307,19 @@ public:
         assert(0==err);
 
         PetscFinalize();
+    }
+
+    /// Initialize PETSc solver with the communicator \a comm
+    void initialize(MPI_Comm comm = PETSC_COMM_WORLD)
+    {
+        m_comm = comm;
+        PetscErrorCode err;
+
+        PETSC_COMM_WORLD = comm;
+        err = PetscInitializeNoArguments();
+        assert(0==err);
+        // Note: initialization with command line arguments is done as follows:
+        // PetscInitialize(&argc, &argv, (char *)0, "");
     }
 
     inline Index cols() const { return m_size; }
@@ -318,19 +335,14 @@ public:
       return m_info;
     }
 
-    void initialize(MPI_Comm comm = PETSC_COMM_WORLD)
-    {
-        m_comm = comm;
-        PetscErrorCode err;
+    /// Copies the \a matrix to a PETSc matrix
+    Derived& compute(const MatrixType& matrix);
 
-        PETSC_COMM_WORLD = comm;
-        err = PetscInitializeNoArguments();
-        assert(0==err);
-    }
-
-    Derived& compute(const MatrixType& matrix, MPI_Comm comm = PETSC_COMM_WORLD);
-
-    std::pair<index_t, index_t> computeLayout(index_t nRows, MPI_Comm comm = PETSC_COMM_WORLD)
+    /// Computes local offset and number of rows for this node
+    /// \param[in] nRows : number of global rows of the matrix
+    /// \return result.first  : Number of local rows on this node
+    /// \return result.second : Global index of the first local row on this node
+    std::pair<index_t, index_t> computeLayout(index_t nRows)
     {
         index_t localDofs, globalStart;
         gismo::petsc_computeMatLayout(nRows, localDofs, globalStart, m_comm);
@@ -362,20 +374,13 @@ protected:
 
 
 template<class Derived>
-Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
+Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
 {
-    // m_comm = comm;
     PetscErrorCode err;
-
-    // PETSC_COMM_WORLD = comm;
-    // err = PetscInitializeNoArguments();
-    // assert(0==err);
-    
-    // m_size = matrix.rows();
     int nProc = -1;
-    int rank  = -1;
-
     MPI_Comm_size( m_comm, &nProc );
+
+    int rank  = -1;
     MPI_Comm_rank( m_comm, &rank );
 
     index_t nRows = matrix.rows();
@@ -393,9 +398,6 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix, MPI_Comm comm)
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
     gismo::petsc_copySparseMat(matrix, m_pmatrix, m_localSize, m_localSize, m_globalStart, m_globalStart, m_comm);
 
-    //err = PetscFinalize(); //segfault!
-    //assert(0==err);
-
     m_isInitialized = true;
     return this->derived();
 }
@@ -410,30 +412,38 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     assert(((MatrixBase<XDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major matrices of unknowns are not supported");
     assert(((nrhs == 1) || b.outerStride() == b.rows()));
 
+    // Copy right-hand side vector to PETSc
     gismo::petsc_copyVec(b, m_prhs, m_comm);
 
     PetscErrorCode err;
+    // Create KSP (Krylov Subspace Preconditioned) solver
     err = KSPCreate(m_comm, &ksp);
     assert(0==err);
-    // setupSolver(ksp);
+    // Get the preconditionner
     err = KSPGetPC(ksp, &pc);
     assert(0==err);
 
-    // Reset options
+    // KSP set operators:
+    // first: operator m_pmatrix, second: preconditionner build from the same matrix
+    err = KSPSetOperators(this->ksp, m_pmatrix, m_pmatrix);
+    assert(0==err);
+
+    // Set options (required)
     static_cast<const Derived&>(*this).setDefaultOptions();
 
-    err = KSPSetOperators(this->ksp, m_pmatrix, m_pmatrix); // operator m_pmatrix, preconditionner build from the same matrix
-    assert(0==err);
+    // Solve the system
     err = KSPSolve(this->ksp, m_prhs, m_psol);
     assert(0==err);
 
+    // Get statistics
     int nIter = 0;
     err = KSPGetIterationNumber(this->ksp, &nIter);
     assert(0==err);
+
+    // Copy the solution back to \a x
     gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
 
-    // clearing petsc matrices and vectors
-    //MPI_Barrier(m_comm); // probably barrier not needed
+    // Clear petsc vector
     err = VecZeroEntries(m_prhs);
     assert(0==err);
 }
@@ -494,10 +504,10 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
     using Base::compute;
     using Base::solve;
 
-    PetscKSP(): Base() { }
+    PetscKSP(MPI_Comm comm = PETSC_COMM_WORLD) : Base(comm) { }
 
-    explicit PetscKSP(const MatrixType& matrix, MPI_Comm comm) : Base()
-    { compute(matrix,comm); }
+    explicit PetscKSP(const MatrixType& matrix, MPI_Comm comm) : Base(comm)
+    { compute(matrix); }
 
 };
 
