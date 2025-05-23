@@ -7,7 +7,7 @@
 namespace gismo
 {
 
-// layout for parallel distribution
+/// layout for parallel distribution
 inline int petsc_computeMatLayout( index_t globalDofs, index_t& localDofs, index_t& globalStart, MPI_Comm comm)
 {
     int nProc = -1;
@@ -26,7 +26,7 @@ inline int petsc_computeMatLayout( index_t globalDofs, index_t& localDofs, index
     return 0;
 }
 
-// distributes the matrix
+/// distributes the matrix
 inline void petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const index_t globalCols, MPI_Comm comm)
 {
     PetscCallVoid( MatCreate(comm, &petscMat) );
@@ -43,7 +43,7 @@ inline void petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const ind
 }
 
 
-// preallocates a sequential PETSCs matrix
+/// preallocates a sequential PETSCs matrix
 template<class T>
 void petsc_preallocSeq(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat)
 {
@@ -59,7 +59,10 @@ void petsc_preallocSeq(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMa
     PetscCallVoid( MatSeqAIJSetPreallocation( petscMat, 0, &(nnzRows[0])) );
 }
 
-// reports number of nonzeros in matrix (for doing the allocation of PETSc matrix)
+/// Computes the number of nonzeros in matrix (for doing the allocation of PETSc matrix)
+/// \param[out] nnzRowsDiag     Nonzeros per row in the diagonal "block" of the parallel layout 
+/// \param[out] nnzRowsOffdiag  Nonzeros per row in the rest of off-diagonal "blocks" of the parallel layout 
+/// Used to preallocate PETSc matrix
 template<class T>
 static void petsc_getNonzeroCounts( const gsSparseMatrix<T, RowMajor>& mat, const index_t localRows, const index_t globStartRow, const index_t localCols, const index_t globStartCol,
                         std::vector<index_t>& nnzRowsDiag, std::vector<index_t>& nnzRowsOffdiag) 
@@ -81,7 +84,7 @@ static void petsc_getNonzeroCounts( const gsSparseMatrix<T, RowMajor>& mat, cons
     }
 }
 
-// preallocates a parallel PETSc matrix
+/// preallocates a parallel PETSc matrix
 template<class T>
 static void petsc_preallocMPI(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat, const index_t localRows, const index_t globStartRow, const index_t localCols, const index_t globStartCol)
 {
@@ -93,7 +96,8 @@ static void petsc_preallocMPI(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& 
 }
 
 
-// gismoMat is assumed to be of full size 
+/// Copy an already distributed gsSparseMatrix (only local rows of \a gismoMat have nonzeros)  to distributed PETSc matrix
+/// Also, \a gismoMat is assumed to be of full size 
 template<class T>
 void petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat,
                                 const index_t localRows, const index_t localCols,
@@ -156,8 +160,8 @@ void petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petsc
     PetscCallVoid( MatAssemblyEnd( petscMat, MAT_FINAL_ASSEMBLY ) ); 
 }
 
-
-// gismoVec is assumed to be only the local part (number of rows = localRows)
+/// Copy an already distributed (dense) vector (only the local rows) to distributed PETSc vector
+/// Note: \a gismoVec is assumed to be only the local part (number of rows = localRows)
 template<typename Derived>
 void petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, MPI_Comm comm)
 {
@@ -193,8 +197,8 @@ void petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, 
     PetscCallVoid( VecAssemblyEnd(petscVec) ); 
 }
 
-
-// gismoVec is the global vector
+/// Copies a distributed PETSc vector to a global vector on each MPI node
+/// Note: gismoVec is the same global vector on all processes
 template<typename Derived>  
 void petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm)
 {
@@ -249,6 +253,9 @@ struct petsc_traits< PetscKSP<_MatrixType> >
     typedef typename _MatrixType::StorageIndex StorageIndex;
 };
 
+/**
+Base class for PETSc solvers
+ */
 template<class Derived>
 class PetscImpl : public SparseSolverBase<Derived>
 {
@@ -280,15 +287,17 @@ public:
 
     mutable KSP m_ksp; ///< krylov solver
     mutable PC m_pc;   ///< preconditionner
-
+    // Note: to use direct solver, then there is an option "use preconditionner only" so that KSP is not involved
+    
     MPI_Comm m_comm; ///< communicator
     
     Mat m_pmatrix;      ///< PETSc matrix
+
     mutable Vec m_prhs, m_psol; ///< Solution vector and right-hand side vector
 
     mutable PetscErrorCode m_error; ///< Error code from PETSc
     mutable ComputationInfo m_info;
-    Index m_size;
+    Index m_size; ///< Global size of the matrix
 
     PetscImpl(MPI_Comm comm = PETSC_COMM_WORLD) : m_size(-1)
     {
@@ -490,7 +499,7 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     assert(0==m_error);
 }
 
-
+//Note: KSP has all linear solvers, but PETSc provides also nonlinear solvers and optimizers ...
 template<typename MatrixType>
 class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
 {

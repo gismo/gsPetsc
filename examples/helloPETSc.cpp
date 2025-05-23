@@ -71,6 +71,8 @@ int main(int argc, char *argv[])
     gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
 
     // Get local size and offset for the node
+    // localGlobal.first : local size at this node
+    // localGlobal.second : offset of the global index
     std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
 
     solver.options() = setOptions(slv);
@@ -98,6 +100,10 @@ int main(int argc, char *argv[])
 
     if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
+
+    comm.barrier(); // does this work ?
+    
+    gsInfo <<"Check ("<<_rank<<"): "<< ( (b-x.middleRows(localGlobal.second,localGlobal.first) ).squaredNorm()<1e-8 ) <<"\n";
 
     return EXIT_SUCCESS;
 }
