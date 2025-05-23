@@ -99,6 +99,5 @@ int main(int argc, char *argv[])
     if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
 
-    //PetscFinalize();
     return EXIT_SUCCESS;
 }

@@ -286,6 +286,7 @@ public:
     Mat m_pmatrix;      ///< PETSc matrix
     mutable Vec m_prhs, m_psol; ///< Solution vector and right-hand side vector
 
+    mutable PetscErrorCode m_error; ///< Error code from PETSc
     mutable ComputationInfo m_info;
     Index m_size;
 
@@ -297,17 +298,16 @@ public:
 
     ~PetscImpl()
     {
-        PetscErrorCode err;
-        err = MatDestroy(&m_pmatrix);
-        assert(0==err);
-        err = VecDestroy(&m_psol);
-        assert(0==err);
-        err = VecDestroy(&m_prhs);
-        assert(0==err);
-        err = KSPDestroy(&m_ksp);
-        assert(0==err);
-        //err = PCDestroy(&m_pc); //managed by m_ksp
-        //assert(0==err);
+        m_error = MatDestroy(&m_pmatrix);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_psol);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_prhs);
+        assert(0==m_error);
+        m_error = KSPDestroy(&m_ksp);
+        assert(0==m_error);
+        //m_error = PCDestroy(&m_pc); //managed by m_ksp
+        //assert(0==m_error);
         PetscFinalize();
     }
 
@@ -315,21 +315,20 @@ public:
     void initialize(MPI_Comm comm = PETSC_COMM_WORLD)
     {
         m_comm = comm;
-        PetscErrorCode err;
 
         PETSC_COMM_WORLD = comm;
-        err = PetscInitializeNoArguments();
-        assert(0==err);
+        m_error = PetscInitializeNoArguments();
+        assert(0==m_error);
         // Note: initialization with command line arguments is done as follows:
         // PetscInitialize(&argc, &argv, (char *)0, "");
 
         // Create KSP (Krylov Subspace Preconditioned) solver
-        err = KSPCreate(m_comm, &m_ksp);
-        assert(0==err);
+        m_error = KSPCreate(m_comm, &m_ksp);
+        assert(0==m_error);
 
         // Get the preconditionner
-        err = KSPGetPC(m_ksp, &m_pc);
-        assert(0==err);
+        m_error = KSPGetPC(m_ksp, &m_pc);
+        assert(0==m_error);
     }
 
     gismo::gsOptionList & options() {return m_options;}
@@ -375,18 +374,17 @@ protected:
 
     void applyOptions() const
     {
-        PetscErrorCode err;
-        err = PetscOptionsClear(NULL);
+        m_error = PetscOptionsClear(NULL);
         for ( auto & opt : m_options.getAllEntries() )
         {
-            err = PetscOptionsSetValue(NULL, opt.label.c_str(), opt.val.c_str());
-            assert(0==err);
+            m_error = PetscOptionsSetValue(NULL, opt.label.c_str(), opt.val.c_str());
+            assert(0==m_error);
         }
 
-        err = KSPSetFromOptions(this->m_ksp);
-        assert(0==err);
-        err = PCSetFromOptions(this->m_pc);
-        assert(0==err);
+        m_error = KSPSetFromOptions(this->m_ksp);
+        assert(0==m_error);
+        m_error = PCSetFromOptions(this->m_pc);
+        assert(0==m_error);
 
         // this is for systems with two fields...
         // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_type", "fieldsplit") );
@@ -427,7 +425,6 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
 {
-    PetscErrorCode err;
     int nProc = -1;
     MPI_Comm_size( m_comm, &nProc );
 
@@ -444,8 +441,8 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
     gismo::petsc_computeMatLayout(nRows, localSize, globalStart, m_comm);
 
     gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, m_comm);
-    err = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
-    assert(0==err);
+    m_error = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
+    assert(0==m_error);
 
     m_size = localSize;
 
@@ -471,28 +468,26 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
 
     this->applyOptions();
 
-    PetscErrorCode err;
-
     // KSP set operators:
     // first: operator m_pmatrix, second: preconditionner build from the same matrix
-    err = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
-    assert(0==err);
+    m_error = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
+    assert(0==m_error);
 
     // Solve the system
-    err = KSPSolve(this->m_ksp, m_prhs, m_psol);
-    assert(0==err);
+    m_error = KSPSolve(this->m_ksp, m_prhs, m_psol);
+    assert(0==m_error);
 
     // Get statistics
     int nIter = 0;
-    err = KSPGetIterationNumber(this->m_ksp, &nIter);
-    assert(0==err);
+    m_error = KSPGetIterationNumber(this->m_ksp, &nIter);
+    assert(0==m_error);
 
     // Copy the solution back to \a x
     gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
 
     // Clear petsc vector
-    err = VecZeroEntries(m_prhs);
-    assert(0==err);
+    m_error = VecZeroEntries(m_prhs);
+    assert(0==m_error);
 }
 
 
