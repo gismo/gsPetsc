@@ -631,7 +631,13 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
     m_size = locInfo.first;
 
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
+    // Case: Matrix already distributed
     m_error = gismo::petsc_copySparseMat(matrix, m_pmatrix, locInfo, locInfo, m_comm);
+
+    //.. else
+    // Assumes matrix is non-empty and fully polulated on rank 0 only !
+    //petsc_distributeSparseMat(matrix, m_pmatrix, ...)
+    
     assert(0==m_error);
 
     m_isInitialized = true;
