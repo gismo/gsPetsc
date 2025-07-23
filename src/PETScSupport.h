@@ -7,6 +7,9 @@
 namespace gismo
 {
 
+// forward declaration 
+template<typename Derived> int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm, index_t nBlocks = 1);
+
 /// @brief Compute layout for parallel distribution.
 /// @param[in]  globalDofs  global number of DOFs to be distributed
 /// @param[out] locInfo   number of local DOFs, offset of the first local DOF (for the current rank))
@@ -35,41 +38,10 @@ int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t>& locI
     return 0;
 }
 
-/// Copy a distributed PETSc vector to a global vector on each MPI node
-/// Note: gismoVec is the same global vector on all processes
-template<typename Derived>  
-int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm)
-{
-    int M = 0; // global number of rows
-    PetscCall( VecGetSize(petscVec, &M) );
-    gismoVec.derived().resize(M, 1);
-
-    VecScatter scatterCtx;
-    Vec globalVec;
-    PetscCall( VecScatterCreateToAll(petscVec, &scatterCtx, &globalVec) );
-
-    PetscCall( VecScatterBegin(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
-    PetscCall( VecScatterEnd(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
-    PetscCall( VecScatterDestroy(&scatterCtx) );
-
-    index_t rowIDs[M];
-    for(index_t i = 0; i < M; i++)
-        rowIDs[i] = i;
-
-    real_t vals[M];
-    PetscCall( VecGetValues(globalVec, M, rowIDs, vals) );
-    PetscCall( VecDestroy(&globalVec) );
-
-    for(index_t i = 0; i < M; i++)
-        gismoVec(i) = vals[i];
-
-    return 0;
-}
-
 /// @brief Create vector of ranks owning the individual DOFs.
 /// The same vector is created on each rank, i.e., this function requires MPI communication.
 /// @param[in]  N           global number of DOFs
-/// @param[in]  locInfo   parallel layout info (obtained from petsc_computeMatLayout(...))
+/// @param[in]  locInfo     parallel layout info (obtained from petsc_computeMatLayout(...))
 /// @param[out] result      resulting ownership vector of length \a N
 /// @param[in]  comm        MPI communicator
 /// @return error code
@@ -137,7 +109,7 @@ int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVe
 /// @return mapping vector
 gsVector<index_t> petsc_mapping_block2interlaced(index_t N, index_t nBlocks, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
 {
-    GISMO_ASSERT(N % nBlocks == 0, "Assuming N divisible by nBlocks!");
+    GISMO_ASSERT(N % nBlocks == 0, "Assuming blocks of equal size!");
     index_t blockSize = N / nBlocks;
     
     int nProc = -1;
@@ -173,7 +145,7 @@ gsVector<index_t> petsc_mapping_block2interlaced(index_t N, index_t nBlocks, con
 gsVector<index_t> petsc_mapping_interlaced2block(index_t N, index_t nBlocks, const gsVector<index_t>& rankVec, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
 {
     index_t blockSize = N / nBlocks;
-    GISMO_ASSERT(N % nBlocks == 0, "Assuming N divisible by nBlocks!");
+    GISMO_ASSERT(N % nBlocks == 0, "Assuming blocks of equal size!");
     GISMO_ASSERT(rankVec.rows() == blockSize, "Wrong size of rankVec (should be equal to N/nBlocks).");
 
     gsVector<index_t> result(N);
@@ -185,18 +157,23 @@ gsVector<index_t> petsc_mapping_interlaced2block(index_t N, index_t nBlocks, con
 }
 
 /// distributes the matrix
-int petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const index_t globalCols, MPI_Comm comm)
+int petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const index_t globalCols, MPI_Comm comm, index_t nRowBlocks = 1, index_t nColBlocks = 1)
 {
+    GISMO_ASSERT((globalRows % nRowBlocks == 0) && (globalCols % nColBlocks == 0), "Assuming blocks of equal size!");
+
     PetscCall( MatCreate(comm, &petscMat) );
 
+    index_t nRowsPerBlock = globalRows / nRowBlocks;
+    index_t nColsPerBlock = globalCols / nColBlocks;
+
     std::pair<index_t, index_t> rLocInfo, cLocInfo;
-    petsc_computeMatLayout(globalRows, rLocInfo, comm);
-    petsc_computeMatLayout(globalCols, cLocInfo, comm);
+    petsc_computeMatLayout(nRowsPerBlock, rLocInfo, comm);
+    petsc_computeMatLayout(nColsPerBlock, cLocInfo, comm);
 
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
     PetscCall( MatSetType(petscMat, 1 == nProc ? MATSEQAIJ : MATMPIAIJ) );
-    PetscCall( MatSetSizes(petscMat, rLocInfo.first, cLocInfo.first, globalRows, globalCols) );
+    PetscCall( MatSetSizes(petscMat, nRowBlocks*rLocInfo.first, nColBlocks*cLocInfo.first, globalRows, globalCols) );
 
     return 0;
 }
@@ -223,7 +200,7 @@ void petsc_getNonzeroCounts(const gsSparseMatrix<T, RowMajor>& mat, const std::p
     nnzRowsOffdiag.resize(nRowBlocks * nLocRows, 0);
 
     index_t nRowsPerBlock = mat.rows() / nRowBlocks; // number of rows of one matrix block
-    index_t nColsPerBlock = mat.cols() / nRowBlocks; // number of columns of one matrix block
+    index_t nColsPerBlock = mat.cols() / nColBlocks; // number of columns of one matrix block
 
     for (index_t rb = 0; rb < nRowBlocks; rb++)
     {
@@ -263,10 +240,18 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
 
+    // prepare mapping for block matrix reordering
+
+    gsVector<index_t> rLocSizes, rOffsets, cLocSizes, cOffsets;
+    petsc_createRankInfoVectors(rLocInfo, rLocSizes, rOffsets, comm);
+    petsc_createRankInfoVectors(cLocInfo, cLocSizes, cOffsets, comm);
+    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(M, nRowBlocks, rLocSizes, rOffsets, comm);
+    gsVector<index_t> mapCol = petsc_mapping_block2interlaced(N, nColBlocks, cLocSizes, cOffsets, comm);
+
     // preallocate PETSc matrix
 
-    std::vector<index_t> nnzRowsDiag(rLocInfo.first, 0);
-    std::vector<index_t> nnzRowsOffdiag(rLocInfo.first, 0);    
+    std::vector<index_t> nnzRowsDiag;
+    std::vector<index_t> nnzRowsOffdiag;    
     petsc_getNonzeroCounts(gismoMat, rLocInfo, cLocInfo, nnzRowsDiag, nnzRowsOffdiag, nRowBlocks, nColBlocks);
 
     if (nProc == 1)
@@ -274,13 +259,10 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     else
         PetscCall( MatMPIAIJSetPreallocation( petscMat, 0, &(nnzRowsDiag[0]), 0, &(nnzRowsOffdiag[0])) );
 
+    int rank = -1;
+    MPI_Comm_rank( comm, &rank );
+    
     // copy values
-
-    gsVector<index_t> rLocSizes, rOffsets, cLocSizes, cOffsets;
-    petsc_createRankInfoVectors(rLocInfo, rLocSizes, rOffsets, comm);
-    petsc_createRankInfoVectors(cLocInfo, cLocSizes, cOffsets, comm);
-    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(M, nRowBlocks, rLocSizes, rOffsets, comm);
-    gsVector<index_t> mapCol = petsc_mapping_block2interlaced(N, nColBlocks, cLocSizes, cOffsets, comm);
 
     // const int* outerIndex = gismoMat.outerIndexPtr();
     // const int* innerIndex = gismoMat.innerIndexPtr();
@@ -298,7 +280,7 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
             // indi[0] = ii;
             // int j =  outerIndex[ii];
             // PetscCall( MatSetValues(petscMat, 1, indi, outerIndex[ii+1] - outerIndex[ii], &innerIndex[j], &values[j], INSERT_VALUES) );
-        
+
             for (typename gsSparseMatrix<real_t, RowMajor>::InnerIterator it(gismoMat, ii); it; ++it)
                 PetscCall( MatSetValue(petscMat, mapRow(ii), mapCol(it.col()), it.value(), INSERT_VALUES) );
         }
@@ -327,6 +309,8 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
 
 /// Copy an already distributed (dense) vector (only the local rows) to distributed PETSc vector
 /// Note: \a gismoVec is assumed to be only the local part (number of rows = localRows)
+/// If the vector is a block vector (e.g. with blocks corresponding to components of a vector quantity),
+/// \a gismoVec should contain local parts individual blocks in its columns.
 template<typename Derived>
 int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, MPI_Comm comm)
 {
@@ -338,29 +322,85 @@ int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, M
     MPI_Comm_size( comm, &nProc );;
 
     index_t nrows = gismoVec.rows();
+    index_t nBlocks = gismoVec.cols();
+    index_t globalRowsPerBlock = M / nBlocks;
+    GISMO_ASSERT(M % nBlocks == 0, "Assuming blocks of equal size!");
 
     index_t globalStart, globalEnd;
     PetscCall( VecGetOwnershipRange(petscVec, &globalStart, &globalEnd) );
+    index_t localRows = globalEnd - globalStart;
 
     if (nProc == 1)
-        GISMO_ASSERT(M == nrows, "petsc_copyVec: Incompatible petscVec and gismoVec sizes.");
+        GISMO_ASSERT(M == nBlocks * nrows, "petsc_copyVec: Incompatible petscVec and gismoVec sizes.");
     else
-    {
-        index_t localRows = globalEnd - globalStart;
-        GISMO_ASSERT(localRows == nrows, "petsc_copyVec: Incompatible number of petscVec local rows and gismoVec rows.");
-    }
+        GISMO_ASSERT(localRows == nBlocks * nrows, "petsc_copyVec: Incompatible number of petscVec local rows and gismoVec rows.");
 
-    for (index_t i = 0; i < nrows; i++)
-    {
-        int indi[1];
-        indi[0] = globalStart + i;
 
-        PetscCall( VecSetValues(petscVec, 1, indi, &(gismoVec(i)), INSERT_VALUES) );
+    std::pair<index_t, index_t> locInfo;
+    petsc_computeMatLayout(globalRowsPerBlock, locInfo, comm);
+    gsVector<index_t> locSizes, offsets;
+    petsc_createRankInfoVectors(locInfo, locSizes, offsets, comm);
+    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(M, nBlocks, locSizes, offsets, comm);
+    
+    for (index_t b = 0; b < nBlocks; b++)
+    {
+        for (index_t i = 0; i < nrows; i++)
+        {
+            int ii =  mapRow(b * globalRowsPerBlock + locInfo.second + i);
+            PetscCall( VecSetValue(petscVec, ii, gismoVec(i, b), INSERT_VALUES) );
+        }
     }
 
     PetscCall( VecAssemblyBegin(petscVec) );
     PetscCall( VecAssemblyEnd(petscVec) ); 
 
+    return 0;
+}
+
+/// Copy a distributed PETSc vector to a global vector on each MPI node
+/// Note: gismoVec is the same global vector on all processes
+template<typename Derived>  
+int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm, index_t nBlocks)
+{
+    int M = 0; // global number of rows
+    PetscCall( VecGetSize(petscVec, &M) );
+    gismoVec.derived().resize(M, 1);
+
+    VecScatter scatterCtx;
+    Vec globalVec;
+    PetscCall( VecScatterCreateToAll(petscVec, &scatterCtx, &globalVec) );
+
+    PetscCall( VecScatterBegin(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
+    PetscCall( VecScatterEnd(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
+    PetscCall( VecScatterDestroy(&scatterCtx) );
+
+    index_t rowIDs[M];
+    for(index_t i = 0; i < M; i++)
+        rowIDs[i] = i;
+
+    real_t vals[M];
+    PetscCall( VecGetValues(globalVec, M, rowIDs, vals) );
+    PetscCall( VecDestroy(&globalVec) );
+
+    if (nBlocks == 1)
+    {
+        for(index_t i = 0; i < M; i++)
+            gismoVec(i) = vals[i];
+    }
+    else
+    {
+        std::pair<index_t, index_t> locInfo;
+        petsc_computeMatLayout(M / nBlocks, locInfo, comm);
+        gsVector<index_t> rankVec, locSizes, offsets;
+        petsc_createOwnershipVector(M / nBlocks, locInfo, rankVec, comm);
+        petsc_createRankInfoVectors(locInfo, locSizes, offsets, comm);
+
+        gsVector<index_t> mapRow = petsc_mapping_interlaced2block(M, nBlocks, rankVec, locSizes, offsets, comm);
+
+        for(index_t i = 0; i < M; i++)
+            gismoVec(mapRow(i)) = vals[i];
+    }
+    
     return 0;
 }
 
