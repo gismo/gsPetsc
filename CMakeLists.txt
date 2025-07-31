@@ -1,5 +1,5 @@
 ######################################################################
-## CMakeLists.txt --- gsModule
+## CMakeLists.txt --- gsPetsc
 ## This file is part of the G+Smo library.
 ##
 ## Author: H. Honnerova
