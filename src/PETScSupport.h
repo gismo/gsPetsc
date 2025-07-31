@@ -257,7 +257,7 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     int M = 0; // global number of rows
     int N = 0; // global number of columns
     PetscCall( MatGetSize(petscMat, &M, &N) );
-    GISMO_ASSERT(M > 0 && N>0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
+    GISMO_ASSERT(M > 0 && N > 0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
     GISMO_ASSERT(M == gismoMat.rows() && N == gismoMat.cols(), "petsc_copySparseMat: Incompatible petscMat and gismoMat sizes.");
 
     int nProc = -1;
