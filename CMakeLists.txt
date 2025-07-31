@@ -25,7 +25,7 @@ if(NOT GISMO_WITH_MPI)
   message(WARNING "Please enable MPI by setting -D GISMO_WITH_MPI=ON in order to use PETSc")
 endif(NOT GISMO_WITH_MPI)
 
-execute_process( COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/FindPETSc.cmake ${CMAKE_SOURCE_DIR}/cmake/)
+execute_process( COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindPETSc.cmake ${CMAKE_SOURCE_DIR}/cmake/)
 find_package(PETSc REQUIRED)
 
 # Add object library
@@ -53,13 +53,13 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}"
 # Include directory
 set (GISMO_INCLUDE_DIRS ${GISMO_INCLUDE_DIRS} ${PETSC_INCLUDES}
   CACHE INTERNAL "Gismo include directories" FORCE)
-  
+
 include_directories(${GISMO_INCLUDE_DIRS})
 
 # Linker
 set(gismo_LINKER ${gismo_LINKER} ${PETSC_LIBRARY}
   CACHE INTERNAL "${PROJECT_NAME} extra linker objects" FORCE)
-  
+
 # add example files
 aux_cpp_directory(${CMAKE_CURRENT_SOURCE_DIR}/examples FILES)
 foreach(file ${FILES})
