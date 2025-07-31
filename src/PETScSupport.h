@@ -223,7 +223,7 @@ void petsc_getNonzeroCounts(const gsSparseMatrix<T, RowMajor>& mat, const std::p
     nnzRowsOffdiag.resize(nRowBlocks * nLocRows, 0);
 
     index_t nRowsPerBlock = mat.rows() / nRowBlocks; // number of rows of one matrix block
-    index_t nColsPerBlock = mat.cols() / nRowBlocks; // number of columns of one matrix block
+    index_t nColsPerBlock = mat.cols() / nColBlocks; // number of columns of one matrix block
 
     for (index_t rb = 0; rb < nRowBlocks; rb++)
     {
@@ -249,7 +249,7 @@ void petsc_getNonzeroCounts(const gsSparseMatrix<T, RowMajor>& mat, const std::p
 }
 
 /// Copy an already distributed gsSparseMatrix (only local rows of \a gismoMat have nonzeros)  to distributed PETSc matrix
-/// Also, \a gismoMat is assumed to be of full size 
+/// Also, \a gismoMat is assumed to be of full size
 template<class T>
 int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat, const std::pair<index_t, index_t>& rLocInfo,
                         const std::pair<index_t, index_t>& cLocInfo, MPI_Comm comm, index_t nRowBlocks = 1, index_t nColBlocks = 1)
@@ -257,7 +257,7 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     int M = 0; // global number of rows
     int N = 0; // global number of columns
     PetscCall( MatGetSize(petscMat, &M, &N) );
-    GISMO_ASSERT(M*N > 0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
+    GISMO_ASSERT(M > 0 && N>0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
     GISMO_ASSERT(M == gismoMat.rows() && N == gismoMat.cols(), "petsc_copySparseMat: Incompatible petscMat and gismoMat sizes.");
 
     int nProc = -1;
