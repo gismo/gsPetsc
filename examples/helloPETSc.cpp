@@ -1,4 +1,4 @@
-/** @file helloSubmodule.cpp
+/** @file helloPETSc.cpp
 
     @brief First example of submodule
 
