@@ -416,6 +416,7 @@ namespace gsEigen
 
 template<typename _MatrixType> struct petsc_traits;
 template<typename _MatrixType> class PetscKSP;
+template<typename _MatrixType> class PetscNestKSP;
 
 template<typename _MatrixType>
 struct petsc_traits< PetscKSP<_MatrixType> >
@@ -425,6 +426,16 @@ struct petsc_traits< PetscKSP<_MatrixType> >
     typedef typename _MatrixType::RealScalar RealScalar;
     typedef typename _MatrixType::StorageIndex StorageIndex;
 };
+
+template<typename _MatrixType>
+struct petsc_traits< PetscNestKSP<_MatrixType> >
+{
+    typedef _MatrixType MatrixType;
+    typedef typename _MatrixType::Scalar Scalar;
+    typedef typename _MatrixType::RealScalar RealScalar;
+    typedef typename _MatrixType::StorageIndex StorageIndex;
+};
+
 
 /**
 Base class for PETSc solvers
@@ -703,7 +714,6 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
     typedef typename Base::RealScalar RealScalar;
 
     using Base::compute;
-    using Base::solve;
 
     PetscKSP(MPI_Comm comm = PETSC_COMM_WORLD) : Base(comm) { }
 
@@ -711,5 +721,147 @@ class PetscKSP : public PetscImpl< PetscKSP<MatrixType> >
     { compute(matrix); }
 
 };
+
+namespace internal {
+
+typedef gismo::gsVector<gismo::gsMatrix<real_t>, 2>                     BlockVec;
+
+// this solve_traits class permits to determine the evaluation type with respect to storage kind (Dense vs Sparse)
+template<typename MatrixType>
+struct solve_traits<PetscNestKSP<MatrixType>,BlockVec,Dense>
+{
+    typedef BlockVec PlainObject;
+};
+
+template<typename MatrixType>
+struct traits<Solve<PetscNestKSP<MatrixType>, BlockVec> >
+  : traits<typename solve_traits<PetscNestKSP<MatrixType>,BlockVec,Dense>::PlainObject>
+{
+    typedef BlockVec PlainObject;
+    typedef index_t StorageIndex;
+    typedef traits<PlainObject> BaseTraits;
+    enum {
+        Flags = 0,//BaseTraits::Flags & RowMajorBit,
+        CoeffReadCost = HugeCost
+    };
+};
+
+}
+
+template<typename MatrixType>
+class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
+{
+  protected:
+    typedef PetscImpl<PetscNestKSP> Base;
+
+    using Base::m_options;
+    using Base::m_pmatrix;
+    using Base::m_prhs;
+    using Base::m_psol;
+
+    using Base::m_size;
+    using Base::m_error;
+    using Base::m_comm;
+    using Base::m_isInitialized;
+    
+    friend class PetscImpl< PetscNestKSP<MatrixType> >;
+
+  public:
+
+    typedef typename Base::Scalar Scalar;
+    typedef typename Base::RealScalar RealScalar;
+
+    typedef gismo::gsMatrix<gismo::gsSparseMatrix<real_t, RowMajor>, 2, 2> BlockMat;
+    typedef gismo::gsVector<gismo::gsMatrix<real_t>, 2>                     BlockVec;
+
+    PetscNestKSP(MPI_Comm comm = PETSC_COMM_WORLD) : Base(comm) { }
+
+    explicit PetscNestKSP(const MatrixType& matrix, MPI_Comm comm) : Base(comm)
+    { compute(matrix); }
+
+    /// Copies the \a matrix to a PETSc MATNEST
+    PetscNestKSP & compute(const BlockMat& matrix);
+
+    template<typename Rhs,typename Dest>
+    void _solve_impl(const MatrixBase<Rhs> &b, MatrixBase<Dest> &dest) const;
+
+    inline const Solve<PetscNestKSP, BlockVec>
+    solve(const BlockVec& b) const
+    {
+        return Solve<PetscNestKSP, BlockVec>(*this, b);
+    }
+
+};
+
+template<typename MatrixType>
+PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename PetscNestKSP<MatrixType>::BlockMat& matrix)
+{
+    int nProc = -1;
+    MPI_Comm_size( m_comm, &nProc );
+
+    int rank  = -1;
+    MPI_Comm_rank( m_comm, &rank );
+
+    index_t blRows = matrix.rows();
+    index_t blCols = matrix.cols();
+
+    //matrix(0,0),     matrix(0,1) ...
+
+    
+    m_isInitialized = true;
+    return *this;
+}
+
+/*
+template<class Derived>
+inline const Solve<PetscBlockImpl<Derived>, Rhs>
+PetscBlockImpl<Derived>::solveBlock(const std::vector<MatrixType>& b)
+{
+
+    return Solve<Derived, Rhs>(derived(), b.derived());
+}
+*/
+
+template<class MatrixType>
+template<typename BDerived,typename XDerived>
+void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<XDerived>& x) const
+{
+    return;
+    
+    Index nrhs = Index(b.cols());
+    assert(m_size==b.rows());
+    assert(((MatrixBase<BDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major right hand sides are not supported");
+    assert(((MatrixBase<XDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major matrices of unknowns are not supported");
+    assert(((nrhs == 1) || b.outerStride() == b.rows()));
+
+
+    // Copy right-hand side vector to PETSc
+    //m_error = gismo::petsc_copyVec(b, m_prhs, m_comm);
+    //assert(0==m_error);
+
+    this->applyOptions();
+
+    // KSP set operators:
+    // first: operator m_pmatrix, second: preconditionner build from the same matrix
+    m_error = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
+    assert(0==m_error);
+
+    // Solve the system
+    m_error = KSPSolve(this->m_ksp, m_prhs, m_psol);
+    assert(0==m_error);
+
+    // Get statistics
+    int nIter = 0;
+    m_error = KSPGetIterationNumber(this->m_ksp, &nIter);
+    assert(0==m_error);
+
+    // Copy the solution back to \a x
+    //m_error = gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
+    //assert(0==m_error);
+
+    // Clear petsc vector
+    m_error = VecZeroEntries(m_prhs);
+    assert(0==m_error);
+}
 
 } // end namespace Eigen

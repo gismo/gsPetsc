@@ -84,6 +84,8 @@ int main(int argc, char *argv[])
     // Initialize PETSc solver with the desired communicator
     gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
 
+    gsEigen::PetscNestKSP<gsSparseMatrix<real_t,RowMajor> > nest_solver(comm);
+
     solver.options() = setOptions(slv);
     if (0==_rank)
         gsInfo << solver.options() <<"\n";
@@ -133,6 +135,15 @@ int main(int argc, char *argv[])
     x = solver.solve(b);
     solver.print();
 
+    // Block system [F B^T; B 0]
+    gsMatrix<gsSparseMatrix<real_t, RowMajor>, 2, 2> BMat;
+    BMat(0,0) = BMat(1,1) = Q;
+    gsVector<gsMatrix<real_t>, 2> Bx, BVec;
+    BVec[0] = BVec[1] = b;
+    nest_solver.compute(BMat);
+    Bx = nest_solver.solve(BVec);
+    nest_solver.print();   
+    
     if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
 
