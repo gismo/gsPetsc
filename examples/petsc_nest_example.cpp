@@ -82,7 +82,7 @@ int main(int argc, char *argv[])
     }
 
     // Initialize PETSc solver with the desired communicator
-    gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
+    gsEigen::PetscNestKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
 
     solver.options() = setOptions(slv);
     if (0==_rank)
@@ -129,17 +129,29 @@ int main(int argc, char *argv[])
         Q.makeCompressed(); // always call makeCompressed after sparse matrix has been filled
     }
 
-    solver.compute(Q);
-    x = solver.solve(b);
+    // Block system [F B^T; B 0]
+    gsMatrix<gsSparseMatrix<real_t, RowMajor>, 2, 2> BMat;
+    BMat(0,0) = BMat(1,1) = Q;
+    gsVector<gsMatrix<real_t>, 2> Bx, BVec;
+    BVec[0] = BVec[1] = b;
+
+    solver.compute(BMat);
+
+    Bx[0].setOnes(2,1);
+    Bx[1].setOnes(2,1);
+    //Bx = // TO DO
+        solver.solve(BVec);
     solver.print();
-    
+
+
     if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
 
     comm.barrier(); // does this work ?
 
-    std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
-    gsInfo <<"Check ("<<_rank<<"): "<< ( (b-x.middleRows(localGlobal.second,localGlobal.first) ).squaredNorm()<1e-8 ) <<"\n";
+    //std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
+    //gsInfo <<"Check ("<<_rank<<"): "<< ( (b-x.middleRows(localGlobal.second,localGlobal.first) ).squaredNorm()<1e-8 ) <<"\n";
 
+   
     return EXIT_SUCCESS;
 }

@@ -504,7 +504,7 @@ public:
             //m_error = PCDestroy(&m_pc); //managed by m_ksp
             //assert(0==m_error);
         }
-        PetscFinalize();
+        PetscFinalize(); // for now called outside 
     }
 
     /// Initialize PETSc solver with the communicator \a comm
@@ -512,7 +512,7 @@ public:
     {
         m_comm = comm;
 
-        PETSC_COMM_WORLD = comm;
+        //PETSC_COMM_WORLD = comm; // do not call
         m_error = PetscInitializeNoArguments();
         assert(0==m_error);
         // Note: initialization with command line arguments is done as follows:
@@ -622,7 +622,6 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
 {
-    // /*
     if (m_isInitialized) // did we call compute before ?
     {
         m_error = MatDestroy(&m_pmatrix);
@@ -632,7 +631,6 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
         m_error = VecDestroy(&m_prhs);
         assert(0==m_error);
     }
-    //*/
 
     int nProc = -1;
     MPI_Comm_size( m_comm, &nProc );
@@ -866,6 +864,16 @@ class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
 template<typename MatrixType>
 PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename PetscNestKSP<MatrixType>::BlockMat& matrix)
 {
+    if (m_isInitialized) // did we call compute before ?
+    {
+        m_error = MatDestroy(&m_pmatrix);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_psol);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_prhs);
+        assert(0==m_error);
+    }
+
     int nProc = -1;
     MPI_Comm_size( m_comm, &nProc );
 
