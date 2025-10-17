@@ -491,16 +491,19 @@ public:
 
     ~PetscImpl()
     {
-        m_error = MatDestroy(&m_pmatrix);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_psol);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_prhs);
-        assert(0==m_error);
-        m_error = KSPDestroy(&m_ksp);
-        assert(0==m_error);
-        //m_error = PCDestroy(&m_pc); //managed by m_ksp
-        //assert(0==m_error);
+        if (m_isInitialized)
+        {
+            m_error = MatDestroy(&m_pmatrix);
+            assert(0==m_error);
+            m_error = VecDestroy(&m_psol);
+            assert(0==m_error);
+            m_error = VecDestroy(&m_prhs);
+            assert(0==m_error);
+            m_error = KSPDestroy(&m_ksp);
+            assert(0==m_error);
+            //m_error = PCDestroy(&m_pc); //managed by m_ksp
+            //assert(0==m_error);
+        }
         PetscFinalize();
     }
 
@@ -619,6 +622,18 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
 {
+    // /*
+    if (m_isInitialized) // did we call compute before ?
+    {
+        m_error = MatDestroy(&m_pmatrix);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_psol);
+        assert(0==m_error);
+        m_error = VecDestroy(&m_prhs);
+        assert(0==m_error);
+    }
+    //*/
+
     int nProc = -1;
     MPI_Comm_size( m_comm, &nProc );
 
@@ -731,8 +746,33 @@ template<typename MatrixType>
 struct solve_traits<PetscNestKSP<MatrixType>,BlockVec,Dense>
 {
     typedef BlockVec PlainObject;
+    typedef index_t StorageIndex;
+    typedef traits<PlainObject> BaseTraits;
+   
+    enum {
+        Flags = 0,//BaseTraits::Flags & RowMajorBit,
+        CoeffReadCost = HugeCost
+    };
 };
 
+template<> struct traits<BlockVec>
+{
+    typedef gsEigen::Dense StorageKind;
+    typedef gismo::gsMatrix<real_t> Scalar;
+    typedef BlockVec NestedExpression;
+    enum {
+        Flags = 0,//BaseTraits::Flags & RowMajorBit,
+        CoeffReadCost = HugeCost,
+        RowsAtCompileTime = Dynamic,
+        ColsAtCompileTime = Dynamic,
+        MaxRowsAtCompileTime = 10,
+        MaxColsAtCompileTime = 10
+    };
+    typedef MatrixXpr XprKind;
+    typedef MatrixXpr XprType;
+};
+
+// /*
 template<typename MatrixType>
 struct traits<Solve<PetscNestKSP<MatrixType>, BlockVec> >
   : traits<typename solve_traits<PetscNestKSP<MatrixType>,BlockVec,Dense>::PlainObject>
@@ -744,9 +784,39 @@ struct traits<Solve<PetscNestKSP<MatrixType>, BlockVec> >
         Flags = 0,//BaseTraits::Flags & RowMajorBit,
         CoeffReadCost = HugeCost
     };
+    typedef MatrixXpr XprKind;
+    typedef MatrixXpr XprType;
+};
+//*/
+
+
+template <>
+struct evaluator<BlockVec> : evaluator_base<BlockVec>
+{
+    typedef BlockVec XprType;
+    typedef BlockVec ArgTypeNested;
+    typedef ArgTypeNested ArgTypeNestedCleaned;
+    typedef typename XprType::CoeffReturnType CoeffReturnType;
+ 
+    enum { CoeffReadCost = HugeCost, Flags = gsEigen::ColMajor };
+
+    evaluator() {}
+
+    evaluator(const XprType& xpr)
+    //: m_vec(&xpr)
+    { }
+
+    index_t cols() const { return m_vec->cols(); }
+    index_t rows() const { return m_vec->rows(); }
+    CoeffReturnType coeff(Index row, Index col) const
+    {
+        return (*m_vec)(row, col);
+    }
+
+    BlockVec * m_vec;
 };
 
-}
+}  // namespace internal
 
 template<typename MatrixType>
 class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
@@ -802,8 +872,8 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
     int rank  = -1;
     MPI_Comm_rank( m_comm, &rank );
 
-    index_t blRows = matrix.rows();
-    index_t blCols = matrix.cols();
+    // index_t blRows = matrix.rows();
+    // index_t blCols = matrix.cols();
 
     //matrix(0,0),     matrix(0,1) ...
 

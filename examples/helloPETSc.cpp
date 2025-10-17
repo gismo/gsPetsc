@@ -84,7 +84,7 @@ int main(int argc, char *argv[])
     // Initialize PETSc solver with the desired communicator
     gsEigen::PetscKSP<gsSparseMatrix<real_t,RowMajor> > solver(comm);
 
-    gsEigen::PetscNestKSP<gsSparseMatrix<real_t,RowMajor> > nest_solver(comm);
+    //gsEigen::PetscNestKSP<gsSparseMatrix<real_t,RowMajor> > nest_solver(comm);
 
     solver.options() = setOptions(slv);
     if (0==_rank)
@@ -140,17 +140,23 @@ int main(int argc, char *argv[])
     BMat(0,0) = BMat(1,1) = Q;
     gsVector<gsMatrix<real_t>, 2> Bx, BVec;
     BVec[0] = BVec[1] = b;
-    nest_solver.compute(BMat);
-    Bx = nest_solver.solve(BVec);
-    nest_solver.print();   
+
+//    nest_solver.compute(BMat);
+
+    Bx[0].setOnes(2,1);
+    Bx[1].setOnes(2,1);
+
+    //    Bx = 
+    //nest_solver.solve(BVec);
+    // nest_solver.print();   
     
     if (0==_rank && mat_size < 200)
         gsInfo <<"Solution: "<< x.transpose() <<"\n";
 
     comm.barrier(); // does this work ?
 
-    std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
-    gsInfo <<"Check ("<<_rank<<"): "<< ( (b-x.middleRows(localGlobal.second,localGlobal.first) ).squaredNorm()<1e-8 ) <<"\n";
+    //std::pair<index_t, index_t> localGlobal = solver.computeLayout(mat_size);
+    //gsInfo <<"Check ("<<_rank<<"): "<< ( (b-x.middleRows(localGlobal.second,localGlobal.first) ).squaredNorm()<1e-8 ) <<"\n";
 
     return EXIT_SUCCESS;
 }
