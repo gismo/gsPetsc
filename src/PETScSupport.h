@@ -257,7 +257,7 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     int M = 0; // global number of rows
     int N = 0; // global number of columns
     PetscCall( MatGetSize(petscMat, &M, &N) );
-    GISMO_ASSERT(M*N > 0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix).");
+    GISMO_ASSERT(M*N > 0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix): ");
     GISMO_ASSERT(M == gismoMat.rows() && N == gismoMat.cols(), "petsc_copySparseMat: Incompatible petscMat and gismoMat sizes.");
 
     int nProc = -1;
@@ -834,6 +834,7 @@ class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
     
     friend class PetscImpl< PetscNestKSP<MatrixType> >;
 
+    // Block matrices
   public:
 
     typedef typename Base::Scalar Scalar;
@@ -861,6 +862,7 @@ class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
 
 };
 
+/// Input is Block system [A B; C D], wehere some blocks might be empty
 template<typename MatrixType>
 PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename PetscNestKSP<MatrixType>::BlockMat& matrix)
 {
@@ -880,12 +882,79 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
     int rank  = -1;
     MPI_Comm_rank( m_comm, &rank );
 
-    // index_t blRows = matrix.rows();
-    // index_t blCols = matrix.cols();
+    const index_t rBlocks = matrix.rows();
+    const index_t cBlocks = matrix.cols();
 
-    //matrix(0,0),     matrix(0,1) ...
-
+    //how many rows belong to the process, and offset
+    //locInfo.first  : number of local rows
+    //locInfo.secind : offset for 1st local row
+    std::vector<std::pair<index_t, index_t> > rlocInfo(rBlocks);
+    std::vector<std::pair<index_t, index_t> > clocInfo(cBlocks);
     
+    gismo::gsVector<index_t> rsz(rBlocks);
+    for (index_t r = 0 ; r!=rBlocks; ++r)
+    {
+        for (index_t c = 0 ; c!=cBlocks; ++c)
+            if (matrix(r,c).size() != 0)
+                rsz[r] = matrix(r,c).rows();       
+        m_error = gismo::petsc_computeMatLayout(rsz[r], rlocInfo[r], m_comm);
+        assert(0==m_error);
+    }
+
+    gismo::gsVector<index_t> csz(rBlocks);
+    for (index_t c = 0 ; c!=cBlocks; ++c)
+    {
+        for (index_t r = 0 ; r!=cBlocks; ++r)
+            if (matrix(r,c).size() != 0)
+                csz[c] = matrix(r,c).cols();
+        m_error = gismo::petsc_computeMatLayout(csz[c], clocInfo[c], m_comm);
+        assert(0==m_error);
+    }
+
+    m_size = 0;
+    for (index_t c = 0 ; c!=rBlocks; ++c) m_size += csz[c];
+            
+    std::vector<Mat> m_block(rBlocks*cBlocks, Mat() ); // TODO
+    MatCreateNest(m_comm, rBlocks, nullptr, cBlocks, nullptr,  m_block.data(),  &m_pmatrix);
+    MatNestSetVecType(m_pmatrix, VECNEST);
+    m_error = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
+    assert(0==m_error);
+
+    for (index_t r = 0 ; r!=rBlocks; ++r)
+        for (index_t c = 0 ; c!=cBlocks; ++c)
+        {
+            if (matrix(r,c).size() != 0)
+            {
+                m_block.push_back( Mat() );
+                m_error = MatCreate(m_comm, &m_block.back());
+                m_error = MatSetType(m_block.back(), 1 == nProc ? MATSEQAIJ : MATMPIAIJ);
+                assert(0==m_error);
+                m_error = MatSetSizes(m_block.back(), rlocInfo[r].first, clocInfo[c].first, rsz[r], csz[c]);
+                assert(0==m_error);
+                // TO try: first MatCreateNestc and afterwards fill in after calling MatNestGetSubMat(m_prhs, r,c &tmp);
+                m_error = gismo::petsc_copySparseMat(matrix(r,c), m_block.back(), rlocInfo[r], clocInfo[c], m_comm);
+                assert(0==m_error);
+            }
+            else
+                m_block.push_back(nullptr);
+        }
+
+    std::vector<Vec> m_brhs;
+    m_brhs.reserve(cBlocks);
+    for (index_t c = 0 ; c!=cBlocks; ++c)
+    {
+        m_brhs.push_back( Vec() );
+        for (index_t r = 0 ; r!=rBlocks; ++r)
+            if (matrix(r,c).size() != 0)
+            {
+                m_error = MatCreateVecs(m_block[r*cBlocks+c], NULL, &m_brhs.back());
+                break;
+            }
+    }
+
+    m_error = VecCreateNest(m_comm, cBlocks, NULL, m_brhs.data(), &m_prhs);
+    assert(0==m_error);
+
     m_isInitialized = true;
     return *this;
 }
@@ -904,18 +973,15 @@ template<class MatrixType>
 template<typename BDerived,typename XDerived>
 void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<XDerived>& x) const
 {
-    return;
-    
-    Index nrhs = Index(b.cols());
-    assert(m_size==b.rows());
-    assert(((MatrixBase<BDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major right hand sides are not supported");
-    assert(((MatrixBase<XDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major matrices of unknowns are not supported");
-    assert(((nrhs == 1) || b.outerStride() == b.rows()));
+    gsDebugVar( "Solving nest..");
 
-
-    // Copy right-hand side vector to PETSc
-    //m_error = gismo::petsc_copyVec(b, m_prhs, m_comm);
-    //assert(0==m_error);
+    // Copy right-hand side vector to PETSc   
+    for (index_t c = 0 ; c!=b.rows(); ++c)
+    {
+        Vec tmp;
+        VecNestGetSubVec(m_prhs, c, &tmp);
+        m_error = gismo::petsc_copyVec(b(c,0), tmp, m_comm);
+    }
 
     this->applyOptions();
 
@@ -934,8 +1000,14 @@ void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, Matrix
     assert(0==m_error);
 
     // Copy the solution back to \a x
-    //m_error = gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
-    //assert(0==m_error);
+    for (index_t c = 0 ; c!=b.rows(); ++c)
+    {
+        Vec tmp;
+        VecNestGetSubVec(m_psol, c, &tmp);
+        m_error = gismo::petsc_copyVecToGismo(tmp, x(c,0), m_comm);
+        assert(0==m_error);
+        gsDebugVar( x(c,0).transpose() );//solution
+    }
 
     // Clear petsc vector
     m_error = VecZeroEntries(m_prhs);
