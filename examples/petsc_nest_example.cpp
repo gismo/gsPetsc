@@ -132,7 +132,7 @@ int main(int argc, char *argv[])
     // Block system [F B^T; B 0]
     gsMatrix<gsSparseMatrix<real_t, RowMajor>, 2, 2> BMat;
     BMat(0,0) = Q;
-    BMat(1,1) = 2 * Q;
+    BMat(1,1) = 0.5 * Q;
     gsVector<gsMatrix<real_t>, 2> Bx, BVec;
     BVec[0] = BVec[1] = b;
 
@@ -147,7 +147,10 @@ int main(int argc, char *argv[])
     //solver.print();
 
     if (0==_rank && mat_size < 200)
-        gsInfo <<"Solution: "<< x.transpose() <<"\n";
+    {
+        gsInfo <<"Solution 0: "<< Bx[0].transpose() <<"\n";
+        gsInfo <<"Solution 1: "<< Bx[1].transpose() <<"\n";
+    }
 
     comm.barrier(); // does this work ?
 
