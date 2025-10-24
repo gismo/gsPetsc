@@ -953,11 +953,29 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
 
     m_size = 0;
     for (index_t c = 0 ; c!=rBlocks; ++c) m_size += csz[c];
-            
-    std::vector<Mat> m_block(rBlocks*cBlocks, Mat() ); // TODO
-    MatCreateNest(m_comm, rBlocks, nullptr, cBlocks, nullptr,  m_block.data(),  &m_pmatrix);
+        
+    std::vector<Mat> bmatrix;
+    bmatrix.reserve(rBlocks*cBlocks);
+    for (index_t r = 0 ; r!=rBlocks; ++r)
+        for (index_t c = 0 ; c!=cBlocks; ++c)
+        {
+            if (matrix(r,c).size() != 0)
+            {
+                bmatrix.push_back(Mat());
+                m_error = MatCreate(m_comm, &bmatrix.back());
+                assert(0==m_error);
+                m_error = MatSetType(bmatrix.back(), 1 == nProc ? MATSEQAIJ : MATMPIAIJ);
+                assert(0==m_error);
+                m_error = MatSetSizes(bmatrix.back(), rlocInfo[r].first, clocInfo[c].first, rsz[r], csz[c]);
+                assert(0==m_error);
+            }
+            else
+                bmatrix.push_back(NULL);
+        }
+
+    MatCreateNest(m_comm, rBlocks, nullptr, cBlocks, nullptr,  bmatrix.data(),  &m_pmatrix);
     MatNestSetVecType(m_pmatrix, VECNEST);
-    m_error = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
+    m_error = MatCreateVecs(m_pmatrix, &m_psol, NULL);
     assert(0==m_error);
 
     for (index_t r = 0 ; r!=rBlocks; ++r)
@@ -965,34 +983,39 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
         {
             if (matrix(r,c).size() != 0)
             {
-                m_block.push_back( Mat() );
-                m_error = MatCreate(m_comm, &m_block.back());
-                m_error = MatSetType(m_block.back(), 1 == nProc ? MATSEQAIJ : MATMPIAIJ);
+                Mat tmp;
+                m_error = MatNestGetSubMat(m_pmatrix, r, c, &tmp);
                 assert(0==m_error);
-                m_error = MatSetSizes(m_block.back(), rlocInfo[r].first, clocInfo[c].first, rsz[r], csz[c]);
-                assert(0==m_error);
-                // TO try: first MatCreateNestc and afterwards fill in after calling MatNestGetSubMat(m_prhs, r,c &tmp);
-                m_error = gismo::petsc_copySparseMat(matrix(r,c), m_block.back(), rlocInfo[r], clocInfo[c], m_comm);
+                m_error = gismo::petsc_copySparseMat(matrix(r,c), tmp, rlocInfo[r], clocInfo[c], m_comm);
                 assert(0==m_error);
             }
-            else
-                m_block.push_back(nullptr);
         }
 
-    std::vector<Vec> m_brhs;
-    m_brhs.reserve(cBlocks);
-    for (index_t c = 0 ; c!=cBlocks; ++c)
+    // NOTE:
+    // not sure what is happening here
+    // individual blocks are already assembled, but since they are filled "in place", the matnest stays in an unassembled state
+    // KSPSolve then fails with error "Not for unassembled matrix"
+    // hope that the assembly of blocks is not performed twice
+    m_error = MatAssemblyBegin( m_pmatrix, MAT_FINAL_ASSEMBLY );
+    assert(0==m_error);
+    m_error = MatAssemblyEnd( m_pmatrix, MAT_FINAL_ASSEMBLY );
+    assert(0==m_error);
+    
+    std::vector<Vec> brhs;
+    brhs.reserve(rBlocks);
+    for (index_t r = 0 ; r!=rBlocks; ++r)
     {
-        m_brhs.push_back( Vec() );
-        for (index_t r = 0 ; r!=rBlocks; ++r)
+        brhs.push_back(Vec());
+        for (index_t c = 0 ; c!=cBlocks; ++c)
             if (matrix(r,c).size() != 0)
             {
-                m_error = MatCreateVecs(m_block[r*cBlocks+c], NULL, &m_brhs.back());
+                m_error = MatCreateVecs(bmatrix[r*cBlocks+c], NULL, &brhs.back());
+                assert(0==m_error);
                 break;
             }
     }
 
-    m_error = VecCreateNest(m_comm, cBlocks, NULL, m_brhs.data(), &m_prhs);
+    m_error = VecCreateNest(m_comm, cBlocks, NULL, brhs.data(), &m_prhs);
     assert(0==m_error);
 
     m_isInitialized = true;
@@ -1021,6 +1044,7 @@ void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, Matrix
         Vec tmp;
         VecNestGetSubVec(m_prhs, c, &tmp);
         m_error = gismo::petsc_copyVec(b(c,0), tmp, m_comm);
+        assert(0==m_error);
     }
 
     this->applyOptions();
@@ -1046,7 +1070,6 @@ void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, Matrix
         VecNestGetSubVec(m_psol, c, &tmp);
         m_error = gismo::petsc_copyVecToGismo(tmp, x(c,0), m_comm);
         assert(0==m_error);
-        gsDebugVar( x(c,0).transpose() );//solution
     }
 
     // Clear petsc vector
