@@ -15,7 +15,7 @@ template<typename Derived> int petsc_copyVecToGismo(const Vec& petscVec, gsEigen
 /// @param[out] locInfo   number of local DOFs, offset of the first local DOF (for the current rank))
 /// @param[in]  comm        MPI communicator
 /// @return error code
-int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t>& locInfo, MPI_Comm comm)
+inline int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t>& locInfo, MPI_Comm comm)
 {
     // locInfo.first = number of local DOFs
     // locInfo.second = offset of the first local row (i.e. its global index)
@@ -45,7 +45,7 @@ int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t>& locI
 /// @param[out] result      resulting ownership vector of length \a N
 /// @param[in]  comm        MPI communicator
 /// @return error code
-int petsc_createOwnershipVector(index_t N, const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& result, MPI_Comm comm)
+inline int petsc_createOwnershipVector(index_t N, const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& result, MPI_Comm comm)
 {
     int rank = -1;
     MPI_Comm_rank( comm, &rank );
@@ -70,7 +70,7 @@ int petsc_createOwnershipVector(index_t N, const std::pair<index_t, index_t>& lo
 /// @param[out] offsets   vector of offsets for all ranks
 /// @param[in]  comm      MPI communicator
 /// @return error code
-int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& locSizes, gsVector<index_t>& offsets, MPI_Comm comm)
+inline int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& locSizes, gsVector<index_t>& offsets, MPI_Comm comm)
 {
     int nProc = -1;
     int rank = -1;
@@ -107,7 +107,7 @@ int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVe
 /// @param[in] offsets  vector of offsets for all ranks
 /// @param[in] comm     MPI communicator
 /// @return mapping vector
-gsVector<index_t> petsc_mapping_block2interlaced(index_t N, index_t nBlocks, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
+inline gsVector<index_t> petsc_mapping_block2interlaced(index_t N, index_t nBlocks, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
 {
     GISMO_ASSERT(N % nBlocks == 0, "Assuming blocks of equal size!");
     index_t blockSize = N / nBlocks;
@@ -142,7 +142,7 @@ gsVector<index_t> petsc_mapping_block2interlaced(index_t N, index_t nBlocks, con
 /// @param[in] offsets   vector of offsets for all ranks
 /// @param[in] comm      MPI communicator
 /// @return mapping vector
-gsVector<index_t> petsc_mapping_interlaced2block(index_t N, index_t nBlocks, const gsVector<index_t>& rankVec, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
+inline gsVector<index_t> petsc_mapping_interlaced2block(index_t N, index_t nBlocks, const gsVector<index_t>& rankVec, const gsVector<index_t>& locSizes, const gsVector<index_t>& offsets, MPI_Comm comm)
 {
     index_t blockSize = N / nBlocks;
     GISMO_ASSERT(N % nBlocks == 0, "Assuming blocks of equal size!");
@@ -157,7 +157,7 @@ gsVector<index_t> petsc_mapping_interlaced2block(index_t N, index_t nBlocks, con
 }
 
 /// distributes the matrix
-int petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const index_t globalCols, MPI_Comm comm, index_t nRowBlocks = 1, index_t nColBlocks = 1)
+inline int petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const index_t globalCols, MPI_Comm comm, index_t nRowBlocks = 1, index_t nColBlocks = 1)
 {
     GISMO_ASSERT((globalRows % nRowBlocks == 0) && (globalCols % nColBlocks == 0), "Assuming blocks of equal size!");
 
@@ -407,7 +407,7 @@ int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gism
 /// @brief Print ordered output gathered from all ranks.
 /// @param[in] outStr output string
 /// @param[in] comm   MPI communicator
-void printOrderedOutput(std::string outStr, gsMpiComm comm)
+inline void printOrderedOutput(std::string outStr, gsMpiComm comm)
 {
     int rank = comm.rank();
     int nProc = comm.size();
