@@ -362,7 +362,7 @@ int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, M
 template<typename Derived>  
 int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm, index_t nBlocks)
 {
-    int M = 0; // global number of rows
+    PetscInt M = 0; // global number of rows
     PetscCall( VecGetSize(petscVec, &M) );
     gismoVec.derived().resize(M, 1);
 
@@ -374,17 +374,17 @@ int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gism
     PetscCall( VecScatterEnd(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
     PetscCall( VecScatterDestroy(&scatterCtx) );
 
-    index_t rowIDs[M];
-    for(index_t i = 0; i < M; i++)
+    std::vector<PetscInt> rowIDs(M);
+    for(PetscInt i = 0; i < M; i++)
         rowIDs[i] = i;
 
-    real_t vals[M];
-    PetscCall( VecGetValues(globalVec, M, rowIDs, vals) );
+    std::vector<PetscScalar> vals(M);
+    PetscCall( VecGetValues(globalVec, M, rowIDs.data(), vals.data()) );
     PetscCall( VecDestroy(&globalVec) );
 
     if (nBlocks == 1)
     {
-        for(index_t i = 0; i < M; i++)
+        for(PetscInt i = 0; i < M; i++)
             gismoVec(i) = vals[i];
     }
     else
@@ -397,7 +397,7 @@ int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gism
 
         gsVector<index_t> mapRow = petsc_mapping_interlaced2block(M, nBlocks, rankVec, locSizes, offsets, comm);
 
-        for(index_t i = 0; i < M; i++)
+        for(PetscInt i = 0; i < M; i++)
             gismoVec(mapRow(i)) = vals[i];
     }
     
