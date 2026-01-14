@@ -193,10 +193,17 @@ private:
     {
         // Destroy existing matrix if re-assembling
         if (m_A) { MatDestroy(&m_A); m_A = NULL; }
-        // Create parallel matrix and set options
+        // Create matrix and set options
+        // Choose matrix type based on communicator size
         PetscCallVoid(MatCreate(m_comm, &m_A));
         PetscCallVoid(MatSetSizes(m_A, PETSC_DECIDE, PETSC_DECIDE, rows, cols));
-        PetscCallVoid(MatSetType(m_A, MATMPIAIJ));
+        
+        // Use SEQAIJ for single process, MPIAIJ for multiple processes
+        if (m_nProc == 1) {
+            PetscCallVoid(MatSetType(m_A, MATSEQAIJ));
+        } else {
+            PetscCallVoid(MatSetType(m_A, MATMPIAIJ));
+        }
 
         // Assemble Matrix using a robust, correct parallel assembly routine
         assembleMatrix(localA, m_rank, m_nProc);
@@ -207,10 +214,15 @@ private:
     {
         // Destroy existing RHS vector if re-assembling
         if (m_b) { VecDestroy(&m_b); m_b = NULL; }
-        // Create RHS vector
+        // Create RHS vector - choose type based on communicator size
         PetscCallVoid(VecCreate(m_comm, &m_b));
         PetscCallVoid(VecSetSizes(m_b, PETSC_DECIDE, rows));
-        PetscCallVoid(VecSetType(m_b, VECMPI));
+        
+        if (m_nProc == 1) {
+            PetscCallVoid(VecSetType(m_b, VECSEQ));
+        } else {
+            PetscCallVoid(VecSetType(m_b, VECMPI));
+        }
 
         assembleVector(localB, m_rank, m_nProc);
     }
@@ -238,7 +250,12 @@ private:
         // A broadcast is needed to ensure all processes have a safe upper bound
         PetscCallVoid(MPI_Allreduce(MPI_IN_PLACE, &max_nnz_per_row, 1, MPIU_INT, MPI_MAX, m_comm));
 
-        PetscCallVoid(MatMPIAIJSetPreallocation(m_A, max_nnz_per_row, NULL, max_nnz_per_row, NULL));
+        // Preallocate based on matrix type
+        if (m_nProc == 1) {
+            PetscCallVoid(MatSeqAIJSetPreallocation(m_A, max_nnz_per_row, NULL));
+        } else {
+            PetscCallVoid(MatMPIAIJSetPreallocation(m_A, max_nnz_per_row, NULL, max_nnz_per_row, NULL));
+        }
         // Allow adding new non-zeros just in case our estimate was wrong for some rows
         PetscCallVoid(MatSetOption(m_A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE));
 
