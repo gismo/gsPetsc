@@ -2,13 +2,42 @@
 #pragma once
 
 #include <petsc.h>
+#include <vector>
+
+#include <gsCore/gsDebug.h> // GISMO_STATIC_ASSERT
+#include <gsParallel/gsMpiTraits.h> // MPITraits<index_t>::getType()
+
+#if defined(PETSC_USE_COMPLEX)
+#error "PETScSupport.h assumes a real PetscScalar (gismo real_t is real); this file does not handle complex-scalar PETSc builds."
+#endif
+
+// Pin gismo real_t/index_t widths to PETSc runtime types. Without these,
+// a 64-bit-index PETSc build (--with-64-bit-indices) or a complex-scalar build
+// would silently truncate at the static_casts sprinkled through this file.
+GISMO_STATIC_ASSERT(sizeof(real_t) == sizeof(PetscScalar),
+                    PETScSupport_real_t_width_must_match_PetscScalar);
+GISMO_STATIC_ASSERT(sizeof(index_t) == sizeof(PetscInt),
+                    PETScSupport_index_t_width_must_match_PetscInt);
+
+// PetscCallVoid swallows PETSc error codes (returns void). In PetscImpl we
+// need to surface those failures to callers via info(), so we capture the
+// code into a member (m_lastError) instead. This macro does that and
+// short-circuits the rest of the enclosing method on error, mirroring
+// PetscCall's "return on error" semantics for void-returning methods.
+// Use only inside PetscImpl-derived classes that expose m_lastError.
+#define GISMO_PETSC_CAPTURE(call) \
+    do { \
+        PetscErrorCode _ierr_gismo_ = (call); \
+        if (_ierr_gismo_ != PETSC_SUCCESS) { this->m_lastError = _ierr_gismo_; return; } \
+    } while (0)
 
 // ------------------------------------ PETSc auxiliary functions ------------------------------------
 namespace gismo
 {
 
-// forward declaration 
+// forward declaration
 template<typename Derived> int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm, index_t nBlocks = 1);
+inline int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& locSizes, gsVector<index_t>& offsets, MPI_Comm comm);
 
 /// @brief Compute layout for parallel distribution.
 /// @param[in]  globalDofs  global number of DOFs to be distributed
@@ -25,15 +54,19 @@ inline int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t
     MPI_Comm_size( comm, &nProc );
     MPI_Comm_rank( comm, &rank );
 
-    index_t localDofs = PETSC_DECIDE;
-    PetscCall( PetscSplitOwnershipEqual(comm, &localDofs, &globalDofs) );
+    PetscInt localDofs = PETSC_DECIDE;
+    PetscInt globalDofs_petsc = static_cast<PetscInt>(globalDofs);
+    PetscCall( PetscSplitOwnershipEqual(comm, &localDofs, &globalDofs_petsc) );
 
-    locInfo.first = localDofs;
+    locInfo.first = static_cast<index_t>(localDofs);
 
-    if (nProc > 1 && rank == nProc-1) // last rank (localDofs can be different than for other ranks)
-        locInfo.second = globalDofs - localDofs;
+    if (nProc > 1 && rank == nProc-1)
+        locInfo.second = globalDofs - static_cast<index_t>(localDofs);
     else
-        locInfo.second = rank * localDofs;
+        locInfo.second = static_cast<index_t>(rank) * static_cast<index_t>(localDofs);
+
+    GISMO_ENSURE(static_cast<PetscInt>(static_cast<index_t>(localDofs)) == localDofs,
+                 "PETScSupport: PetscInt/index_t width mismatch for localDofs " << localDofs);
 
     return 0;
 }
@@ -47,18 +80,22 @@ inline int petsc_computeMatLayout(index_t globalDofs, std::pair<index_t, index_t
 /// @return error code
 inline int petsc_createOwnershipVector(index_t N, const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& result, MPI_Comm comm)
 {
-    int rank = -1;
-    MPI_Comm_rank( comm, &rank );
+    int nProc = -1;
+    MPI_Comm_size( comm, &nProc );
 
-    Vec rankVec;
-    PetscCall( VecCreate(comm, &rankVec) );
-    PetscCall( VecSetType(rankVec, VECMPI) );
-    PetscCall( VecSetSizes(rankVec, locInfo.first, N) );
+    // Direct integer MPI_Allgather of each rank's (count, offset), then a
+    // local O(N) fill -- replaces a VECMPI-of-PetscScalar round-trip through
+    // petsc_copyVecToGismo's VecScatterCreateToAll (which pays for an O(N)
+    // scatter just to move nProc-many integers, and casts them through
+    // PetscScalar for no reason: rank ids are plain MPI data, not a PETSc
+    // quantity).
+    gsVector<index_t> counts, offsets;
+    petsc_createRankInfoVectors(locInfo, counts, offsets, comm);
 
-    for (index_t i = locInfo.second; i < locInfo.second + locInfo.first; i++)
-        PetscCall( VecSetValue(rankVec, i, rank, INSERT_VALUES) );
-
-    petsc_copyVecToGismo(rankVec, result, comm);
+    result.resize(N);
+    for (int r = 0; r < nProc; ++r)
+        for (index_t i = 0; i < counts[r]; ++i)
+            result(offsets[r] + i) = static_cast<index_t>(r);
 
     return 0;
 }
@@ -73,26 +110,22 @@ inline int petsc_createOwnershipVector(index_t N, const std::pair<index_t, index
 inline int petsc_createRankInfoVectors(const std::pair<index_t, index_t>& locInfo, gsVector<index_t>& locSizes, gsVector<index_t>& offsets, MPI_Comm comm)
 {
     int nProc = -1;
-    int rank = -1;
     MPI_Comm_size( comm, &nProc );
-    MPI_Comm_rank( comm, &rank );
 
-    Vec sizesVec, offsetVec;
-    PetscCall( VecCreate(comm, &sizesVec) );
-    PetscCall( VecSetType(sizesVec, VECMPI) );
-    PetscCall( VecSetSizes(sizesVec, 1, nProc) );
-    PetscCall( VecCreate(comm, &offsetVec) );
-    PetscCall( VecSetType(offsetVec, VECMPI) );
-    PetscCall( VecSetSizes(offsetVec, 1, nProc) );
+    // Direct integer MPI_Allgather, replacing a VECMPI-of-PetscScalar
+    // round-trip through petsc_copyVecToGismo: rank sizes/offsets are plain
+    // MPI data (not a PETSc quantity), so there is no reason to create a
+    // PETSc Vec, cast through PetscScalar, and scatter-to-all just to move
+    // nProc-many integers between ranks.
+    locSizes.resize(nProc);
+    offsets.resize(nProc);
 
-    for (index_t i = 0; i < nProc; i++)
-    {
-        PetscCall( VecSetValue(sizesVec, i, locInfo.first, INSERT_VALUES) );
-        PetscCall( VecSetValue(offsetVec, i, locInfo.second, INSERT_VALUES) );
-    }
-
-    petsc_copyVecToGismo(sizesVec, locSizes, comm);
-    petsc_copyVecToGismo(offsetVec, offsets, comm);
+    const index_t localSize   = locInfo.first;
+    const index_t localOffset = locInfo.second;
+    MPI_Allgather(&localSize,   1, MPITraits<index_t>::getType(),
+                  locSizes.data(), 1, MPITraits<index_t>::getType(), comm);
+    MPI_Allgather(&localOffset, 1, MPITraits<index_t>::getType(),
+                  offsets.data(),  1, MPITraits<index_t>::getType(), comm);
 
     return 0;
 }
@@ -173,7 +206,35 @@ inline int petsc_setupMatrix(Mat& petscMat, const index_t globalRows, const inde
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
     PetscCall( MatSetType(petscMat, 1 == nProc ? MATSEQAIJ : MATMPIAIJ) );
-    PetscCall( MatSetSizes(petscMat, nRowBlocks*rLocInfo.first, nColBlocks*cLocInfo.first, globalRows, globalCols) );
+    PetscCall( MatSetSizes(petscMat, static_cast<PetscInt>(nRowBlocks*rLocInfo.first), static_cast<PetscInt>(nColBlocks*cLocInfo.first), static_cast<PetscInt>(globalRows), static_cast<PetscInt>(globalCols)) );
+
+    return 0;
+}
+
+/// @brief Create a square distributed matrix with an explicit (non-uniform)
+/// row/column layout, one row block per rank.
+///
+/// Unlike petsc_setupMatrix (which splits rows evenly across ranks via
+/// PetscSplitOwnershipEqual), this gives PETSc the exact local row count
+/// for THIS rank -- e.g. gsPartitionedDofMapper::numOwnedDofs(rank), so
+/// PETSc's row ownership matches a METIS-partition-derived DOF assignment
+/// instead of an arbitrary contiguous split. Takes no gsMetis type: the
+/// caller passes the already-computed local count.
+///
+/// @param[out] petscMat    Created, sized (not yet preallocated) matrix.
+/// @param[in]  nGlobal     Global number of rows == columns.
+/// @param[in]  nOwnedLocal Number of rows owned by the calling rank.
+/// @param[in]  comm        MPI communicator.
+inline int petsc_setupMatrixPartitioned(Mat& petscMat, index_t nGlobal, index_t nOwnedLocal, MPI_Comm comm)
+{
+    PetscCall( MatCreate(comm, &petscMat) );
+
+    int nProc = -1;
+    MPI_Comm_size( comm, &nProc );
+    PetscCall( MatSetType(petscMat, 1 == nProc ? MATSEQAIJ : MATMPIAIJ) );
+    PetscCall( MatSetSizes(petscMat,
+                           static_cast<PetscInt>(nOwnedLocal), static_cast<PetscInt>(nOwnedLocal),
+                           static_cast<PetscInt>(nGlobal), static_cast<PetscInt>(nGlobal)) );
 
     return 0;
 }
@@ -231,33 +292,47 @@ template<class T>
 int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscMat, const std::pair<index_t, index_t>& rLocInfo,
                         const std::pair<index_t, index_t>& cLocInfo, MPI_Comm comm, index_t nRowBlocks = 1, index_t nColBlocks = 1)
 {
-    int M = 0; // global number of rows
-    int N = 0; // global number of columns
+    PetscInt M = 0; // global number of rows
+    PetscInt N = 0; // global number of columns
     PetscCall( MatGetSize(petscMat, &M, &N) );
+    GISMO_ENSURE(static_cast<PetscInt>(static_cast<index_t>(M)) == M,
+                 "PETScSupport: PetscInt/index_t width mismatch for global rows " << M);
+    GISMO_ENSURE(static_cast<PetscInt>(static_cast<index_t>(N)) == N,
+                 "PETScSupport: PetscInt/index_t width mismatch for global cols " << N);
     GISMO_ASSERT(M*N > 0, "petsc_copySparseMat: PETSc matrix with zero rows and/or columns, the global and local sizes of the matrix must be set before (e.g. in function petsc_setupMatrix): ");
-    GISMO_ASSERT(M == gismoMat.rows() && N == gismoMat.cols(), "petsc_copySparseMat: Incompatible petscMat and gismoMat sizes.");
+    GISMO_ASSERT(static_cast<index_t>(M) == gismoMat.rows() && static_cast<index_t>(N) == gismoMat.cols(), "petsc_copySparseMat: Incompatible petscMat and gismoMat sizes.");
 
     int nProc = -1;
     MPI_Comm_size( comm, &nProc );
 
-    // prepare mapping for block matrix reordering
+    // Single-field case (the common PetscImpl::compute path): interlaced and
+    // block orderings are identical when there is only one block per side,
+    // so skip building the O(N) mapRow/mapCol reordering vectors entirely
+    // and insert with un-remapped indices below. Mirrors the nBlocks==1
+    // special-casing already done in petsc_copyVec/petsc_copyVecToGismo.
+    const bool identityMapping = (nRowBlocks == 1 && nColBlocks == 1);
 
-    gsVector<index_t> rLocSizes, rOffsets, cLocSizes, cOffsets;
-    petsc_createRankInfoVectors(rLocInfo, rLocSizes, rOffsets, comm);
-    petsc_createRankInfoVectors(cLocInfo, cLocSizes, cOffsets, comm);
-    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(M, nRowBlocks, rLocSizes, rOffsets, comm);
-    gsVector<index_t> mapCol = petsc_mapping_block2interlaced(N, nColBlocks, cLocSizes, cOffsets, comm);
+    gsVector<index_t> mapRow, mapCol; // left empty when identityMapping
+    if (!identityMapping)
+    {
+        gsVector<index_t> rLocSizes, rOffsets, cLocSizes, cOffsets;
+        petsc_createRankInfoVectors(rLocInfo, rLocSizes, rOffsets, comm);
+        petsc_createRankInfoVectors(cLocInfo, cLocSizes, cOffsets, comm);
+        mapRow = petsc_mapping_block2interlaced(static_cast<index_t>(M), nRowBlocks, rLocSizes, rOffsets, comm);
+        mapCol = petsc_mapping_block2interlaced(static_cast<index_t>(N), nColBlocks, cLocSizes, cOffsets, comm);
+    }
 
     // preallocate PETSc matrix
 
-    std::vector<index_t> nnzRowsDiag;
-    std::vector<index_t> nnzRowsOffdiag;    
-    petsc_getNonzeroCounts(gismoMat, rLocInfo, cLocInfo, nnzRowsDiag, nnzRowsOffdiag, nRowBlocks, nColBlocks);
+    std::vector<index_t> nnzRowsDiag_idx, nnzRowsOffdiag_idx;
+    petsc_getNonzeroCounts(gismoMat, rLocInfo, cLocInfo, nnzRowsDiag_idx, nnzRowsOffdiag_idx, nRowBlocks, nColBlocks);
+    std::vector<PetscInt> nnzRowsDiag(nnzRowsDiag_idx.begin(), nnzRowsDiag_idx.end());
+    std::vector<PetscInt> nnzRowsOffdiag(nnzRowsOffdiag_idx.begin(), nnzRowsOffdiag_idx.end());
 
     if (nProc == 1)
-        PetscCall( MatSeqAIJSetPreallocation( petscMat, 0, &(nnzRowsDiag[0])) );
+        PetscCall( MatSeqAIJSetPreallocation( petscMat, 0, nnzRowsDiag.data()) );
     else
-        PetscCall( MatMPIAIJSetPreallocation( petscMat, 0, &(nnzRowsDiag[0]), 0, &(nnzRowsOffdiag[0])) );
+        PetscCall( MatMPIAIJSetPreallocation( petscMat, 0, nnzRowsDiag.data(), 0, nnzRowsOffdiag.data()) );
 
     int rank = -1;
     MPI_Comm_rank( comm, &rank );
@@ -268,12 +343,12 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
     // const int* innerIndex = gismoMat.innerIndexPtr();
     // const double* values = gismoMat.valuePtr();
 
-    index_t rBlockSize = M / nRowBlocks;
+    index_t rBlockSize = static_cast<index_t>(M) / nRowBlocks;
     for (index_t b = 0; b < nRowBlocks; b++)
     {
-        for (int i = 0; i < rLocInfo.first; i++)
+        for (index_t i = 0; i < rLocInfo.first; i++)
         {
-            int ii = b * rBlockSize + rLocInfo.second + i;
+            index_t ii = b * rBlockSize + rLocInfo.second + i;
 
             // int ii = rLocInfo.second + i;
             // int indi[1];
@@ -281,8 +356,12 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
             // int j =  outerIndex[ii];
             // PetscCall( MatSetValues(petscMat, 1, indi, outerIndex[ii+1] - outerIndex[ii], &innerIndex[j], &values[j], INSERT_VALUES) );
 
+            const PetscInt prow = identityMapping ? static_cast<PetscInt>(ii) : static_cast<PetscInt>(mapRow(ii));
             for (typename gsSparseMatrix<real_t, RowMajor>::InnerIterator it(gismoMat, ii); it; ++it)
-                PetscCall( MatSetValue(petscMat, mapRow(ii), mapCol(it.col()), it.value(), INSERT_VALUES) );
+            {
+                const PetscInt pcol = identityMapping ? static_cast<PetscInt>(it.col()) : static_cast<PetscInt>(mapCol(it.col()));
+                PetscCall( MatSetValue(petscMat, prow, pcol, static_cast<PetscScalar>(it.value()), INSERT_VALUES) );
+            }
         }
     }
 
@@ -314,8 +393,10 @@ int petsc_copySparseMat(const gsSparseMatrix<T, RowMajor>& gismoMat, Mat& petscM
 template<typename Derived>
 int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, MPI_Comm comm)
 {
-    int M = 0; // global number of rows
+    PetscInt M = 0; // global number of rows
     PetscCall( VecGetSize(petscVec, &M) );
+    GISMO_ENSURE(static_cast<PetscInt>(static_cast<index_t>(M)) == M,
+                 "PETScSupport: PetscInt/index_t width mismatch for vector size " << M);
     GISMO_ASSERT(M > 0, "petsc_copyVec: PETSc vector with zero rows, the global and local sizes of the vector must be set before.");
 
     int nProc = -1;
@@ -323,31 +404,45 @@ int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, M
 
     index_t nrows = gismoVec.rows();
     index_t nBlocks = gismoVec.cols();
-    index_t globalRowsPerBlock = M / nBlocks;
-    GISMO_ASSERT(M % nBlocks == 0, "Assuming blocks of equal size!");
+    index_t globalRowsPerBlock = static_cast<index_t>(M) / nBlocks;
+    GISMO_ASSERT(M % static_cast<PetscInt>(nBlocks) == 0, "Assuming blocks of equal size!");
 
-    index_t globalStart, globalEnd;
+    PetscInt globalStart, globalEnd;
     PetscCall( VecGetOwnershipRange(petscVec, &globalStart, &globalEnd) );
-    index_t localRows = globalEnd - globalStart;
+    index_t localRows = static_cast<index_t>(globalEnd - globalStart);
 
     if (nProc == 1)
-        GISMO_ASSERT(M == nBlocks * nrows, "petsc_copyVec: Incompatible petscVec and gismoVec sizes.");
+        GISMO_ASSERT(static_cast<index_t>(M) == nBlocks * nrows, "petsc_copyVec: Incompatible petscVec and gismoVec sizes.");
     else
         GISMO_ASSERT(localRows == nBlocks * nrows, "petsc_copyVec: Incompatible number of petscVec local rows and gismoVec rows.");
 
 
     std::pair<index_t, index_t> locInfo;
-    petsc_computeMatLayout(globalRowsPerBlock, locInfo, comm);
+    if (nBlocks == 1)
+        // petscVec already exists and its real ownership range was just
+        // queried above (globalStart/localRows) -- use it directly instead
+        // of re-deriving via petsc_computeMatLayout's rank*localDofs formula
+        // (review #1: don't guess a layout PETSc already told us).
+        locInfo = std::make_pair(localRows, static_cast<index_t>(globalStart));
+    else
+        // Multi-block case: locInfo here is the per-block (per-component)
+        // local count/offset used by petsc_mapping_block2interlaced, which
+        // is not simply the real (interlaced) ownership range above. This
+        // re-derivation is only correct because petscVec is assumed to have
+        // been sized block-consistently with this same petsc_computeMatLayout
+        // split (as petsc_setupMatrix does); deriving the per-block offset
+        // directly from the interlaced ownership range is not done here.
+        petsc_computeMatLayout(globalRowsPerBlock, locInfo, comm);
     gsVector<index_t> locSizes, offsets;
     petsc_createRankInfoVectors(locInfo, locSizes, offsets, comm);
-    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(M, nBlocks, locSizes, offsets, comm);
+    gsVector<index_t> mapRow = petsc_mapping_block2interlaced(static_cast<index_t>(M), nBlocks, locSizes, offsets, comm);
     
     for (index_t b = 0; b < nBlocks; b++)
     {
         for (index_t i = 0; i < nrows; i++)
         {
-            int ii =  mapRow(b * globalRowsPerBlock + locInfo.second + i);
-            PetscCall( VecSetValue(petscVec, ii, gismoVec(i, b), INSERT_VALUES) );
+            PetscInt ii = static_cast<PetscInt>(mapRow(b * globalRowsPerBlock + locInfo.second + i));
+            PetscCall( VecSetValue(petscVec, ii, static_cast<PetscScalar>(gismoVec(i, b)), INSERT_VALUES) );
         }
     }
 
@@ -362,9 +457,11 @@ int petsc_copyVec(const gsEigen::MatrixBase<Derived>& gismoVec, Vec& petscVec, M
 template<typename Derived>  
 int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gismoVec, MPI_Comm comm, index_t nBlocks)
 {
-    int M = 0; // global number of rows
+    PetscInt M = 0; // global number of rows
     PetscCall( VecGetSize(petscVec, &M) );
-    gismoVec.derived().resize(M, 1);
+    GISMO_ENSURE(static_cast<PetscInt>(static_cast<index_t>(M)) == M,
+                 "PETScSupport: PetscInt/index_t width mismatch for vector size " << M);
+    gismoVec.derived().resize(static_cast<index_t>(M), 1);
 
     VecScatter scatterCtx;
     Vec globalVec;
@@ -374,31 +471,33 @@ int petsc_copyVecToGismo(const Vec& petscVec, gsEigen::MatrixBase<Derived>& gism
     PetscCall( VecScatterEnd(scatterCtx, petscVec, globalVec, INSERT_VALUES, SCATTER_FORWARD) );
     PetscCall( VecScatterDestroy(&scatterCtx) );
 
-    index_t rowIDs[M];
-    for(index_t i = 0; i < M; i++)
+    // Heap-allocate these buffers: M is the global DOF count, which for refined
+    // meshes overflows the stack if allocated as VLAs (segfault, see #issue).
+    std::vector<PetscInt> rowIDs(static_cast<size_t>(M));
+    for(PetscInt i = 0; i < M; i++)
         rowIDs[i] = i;
 
-    real_t vals[M];
-    PetscCall( VecGetValues(globalVec, M, rowIDs, vals) );
+    std::vector<PetscScalar> vals(static_cast<size_t>(M));
+    PetscCall( VecGetValues(globalVec, M, rowIDs.data(), vals.data()) );
     PetscCall( VecDestroy(&globalVec) );
 
     if (nBlocks == 1)
     {
-        for(index_t i = 0; i < M; i++)
-            gismoVec(i) = vals[i];
+        for(index_t i = 0; i < static_cast<index_t>(M); i++)
+            gismoVec(i) = static_cast<real_t>(vals[static_cast<size_t>(i)]);
     }
     else
     {
         std::pair<index_t, index_t> locInfo;
-        petsc_computeMatLayout(M / nBlocks, locInfo, comm);
+        petsc_computeMatLayout(static_cast<index_t>(M) / nBlocks, locInfo, comm);
         gsVector<index_t> rankVec, locSizes, offsets;
-        petsc_createOwnershipVector(M / nBlocks, locInfo, rankVec, comm);
+        petsc_createOwnershipVector(static_cast<index_t>(M) / nBlocks, locInfo, rankVec, comm);
         petsc_createRankInfoVectors(locInfo, locSizes, offsets, comm);
 
-        gsVector<index_t> mapRow = petsc_mapping_interlaced2block(M, nBlocks, rankVec, locSizes, offsets, comm);
+        gsVector<index_t> mapRow = petsc_mapping_interlaced2block(static_cast<index_t>(M), nBlocks, rankVec, locSizes, offsets, comm);
 
-        for(index_t i = 0; i < M; i++)
-            gismoVec(mapRow(i)) = vals[i];
+        for(index_t i = 0; i < static_cast<index_t>(M); i++)
+            gismoVec(mapRow(i)) = static_cast<real_t>(vals[static_cast<size_t>(i)]);
     }
     
     return 0;
@@ -519,12 +618,15 @@ public:
 
     mutable Vec m_prhs, m_psol; ///< Solution vector and right-hand side vector
 
-    mutable PetscErrorCode m_error; ///< Error code from PETSc
     mutable ComputationInfo m_info;
-    Index m_size; ///< Global size of the matrix
+    mutable int m_lastError; ///< Most recent PETSc error code from a void-context call. Surfaces via info().
+    Index m_size; ///< Local size of the matrix (number of local rows on this rank). For block solvers, this is the per-block local row count, matching b.rows() for a BlockVec b in _solve_impl.
+    bool m_ownsPetscInit; ///< true if this instance called Initialize() (i.e. we are responsible for finalizing PETSc in the destructor)
 
-    PetscImpl(MPI_Comm comm = PETSC_COMM_WORLD) : m_size(-1)
+    PetscImpl(MPI_Comm comm = PETSC_COMM_WORLD) : m_size(-1), m_ownsPetscInit(false)
     {
+        m_info = Success;
+        m_lastError = 0;
         initialize(comm);
         m_isInitialized = false;// Becomes true when the sparse matrix is given
     }
@@ -533,18 +635,24 @@ public:
     {
         if (m_isInitialized)
         {
-            m_error = MatDestroy(&m_pmatrix);
-            assert(0==m_error);
-            m_error = VecDestroy(&m_psol);
-            assert(0==m_error);
-            m_error = VecDestroy(&m_prhs);
-            assert(0==m_error);
-            m_error = KSPDestroy(&m_ksp);
-            assert(0==m_error);
-            //m_error = PCDestroy(&m_pc); //managed by m_ksp
-            //assert(0==m_error);
+            // m_isInitialized tracks the PETSc objects owned by this solver;
+            // destroying them is the solver's responsibility even when the
+            // caller owns PETSc finalization (see m_ownsPetscInit below).
+            int ierr;
+            ierr = MatDestroy(&m_pmatrix); if (ierr) m_lastError = ierr;
+            ierr = VecDestroy(&m_psol);    if (ierr) m_lastError = ierr;
+            ierr = VecDestroy(&m_prhs);    if (ierr) m_lastError = ierr;
+            ierr = KSPDestroy(&m_ksp);     if (ierr) m_lastError = ierr;
         }
-        PetscFinalize(); // for now called outside 
+        if (m_ownsPetscInit)
+        {
+            // Finalize only if *we* called Initialize -- callers that
+            // initialize PETSc themselves (e.g. the gsMetisPetscAssembly
+            // example, which calls it before constructing a solver) own
+            // the finalization. Forgetting this guard would double-finalize
+            // against such a caller's explicit PetscFinalize().
+            int ierr = PetscFinalize(); if (ierr) m_lastError = ierr;
+        }
     }
 
     /// Initialize PETSc solver with the communicator \a comm
@@ -552,19 +660,14 @@ public:
     {
         m_comm = comm;
 
-        //PETSC_COMM_WORLD = comm; // do not call
-        m_error = PetscInitializeNoArguments();
-        assert(0==m_error);
-        // Note: initialization with command line arguments is done as follows:
-        // PetscInitialize(&argc, &argv, (char *)0, "");
+        PetscBool alreadyInit = PETSC_FALSE;
+        GISMO_PETSC_CAPTURE( PetscInitialized(&alreadyInit) );
+        m_ownsPetscInit = (alreadyInit == PETSC_FALSE);
+        if (m_ownsPetscInit)
+            GISMO_PETSC_CAPTURE( PetscInitializeNoArguments() );
 
-        // Create KSP (Krylov Subspace Preconditioned) solver
-        m_error = KSPCreate(m_comm, &m_ksp);
-        assert(0==m_error);
-
-        // Get the preconditionner
-        m_error = KSPGetPC(m_ksp, &m_pc);
-        assert(0==m_error);
+        GISMO_PETSC_CAPTURE( KSPCreate(m_comm, &m_ksp) );
+        GISMO_PETSC_CAPTURE( KSPGetPC(m_ksp, &m_pc) );
     }
 
     gismo::gsOptionList & options() {return m_options;}
@@ -579,6 +682,8 @@ public:
       */
     ComputationInfo info() const
     {
+      if (m_lastError != 0)
+        return InvalidInput; // a void-context PETSc call failed after compute()
       return m_info;
     }
 
@@ -598,9 +703,7 @@ public:
     std::pair<index_t, index_t> computeLayout(index_t nRows)
     {
         std::pair<index_t, index_t> result;
-        m_error = gismo::petsc_computeMatLayout(nRows, result, m_comm);
-        assert(0==m_error);
-        
+        PetscCallAbort(m_comm, gismo::petsc_computeMatLayout(nRows, result, m_comm));
         return result;
     }
     
@@ -611,17 +714,12 @@ protected:
 
     void applyOptions() const
     {
-        m_error = PetscOptionsClear(NULL);
+        GISMO_PETSC_CAPTURE( PetscOptionsClear(NULL) );
         for ( auto & opt : m_options.getAllEntries() )
-        {
-            m_error = PetscOptionsSetValue(NULL, opt.label.c_str(), opt.val.c_str());
-            assert(0==m_error);
-        }
+            GISMO_PETSC_CAPTURE( PetscOptionsSetValue(NULL, opt.label.c_str(), opt.val.c_str()) );
 
-        m_error = KSPSetFromOptions(this->m_ksp);
-        assert(0==m_error);
-        m_error = PCSetFromOptions(this->m_pc);
-        assert(0==m_error);
+        GISMO_PETSC_CAPTURE( KSPSetFromOptions(this->m_ksp) );
+        GISMO_PETSC_CAPTURE( PCSetFromOptions(this->m_pc) );
 
         // this is for systems with two fields...
         // PetscCallVoid( PetscOptionsSetValue(NULL, "-pc_type", "fieldsplit") );
@@ -662,14 +760,13 @@ protected:
 template<class Derived>
 Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
 {
+    m_lastError = 0; // clear any stale error from a previous compute()/solve() cycle
+
     if (m_isInitialized) // did we call compute before ?
     {
-        m_error = MatDestroy(&m_pmatrix);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_psol);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_prhs);
-        assert(0==m_error);
+        PetscCallAbort(m_comm, MatDestroy(&m_pmatrix));
+        PetscCallAbort(m_comm, VecDestroy(&m_psol));
+        PetscCallAbort(m_comm, VecDestroy(&m_prhs));
     }
 
     int nProc = -1;
@@ -682,27 +779,29 @@ Derived& PetscImpl<Derived>::compute(const MatrixType& matrix)
     index_t nCols = matrix.cols();
     assert(nRows==nCols && "expecting square mat");
 
-    std::pair<index_t, index_t> locInfo; 
-    m_error = gismo::petsc_computeMatLayout(nRows, locInfo, m_comm);
-    assert(0==m_error);
+    PetscCallAbort(m_comm, gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, m_comm));
 
-    m_error = gismo::petsc_setupMatrix(m_pmatrix, nRows, nCols, m_comm);
-    assert(0==m_error);
+    PetscCallAbort(m_comm, MatCreateVecs(m_pmatrix, &m_psol, &m_prhs));
 
-    m_error = MatCreateVecs(m_pmatrix, &m_psol, &m_prhs);
-    assert(0==m_error);
+    // Ask PETSc for the row range it actually assigned instead of
+    // re-deriving it via petsc_computeMatLayout's rank*localDofs formula:
+    // the Mat already exists at this point, so there is no need to guess,
+    // and this stays correct regardless of PETSc's internal splitting logic.
+    PetscInt rowStart = 0, rowEnd = 0;
+    PetscCallAbort(m_comm, MatGetOwnershipRange(m_pmatrix, &rowStart, &rowEnd));
+    std::pair<index_t, index_t> locInfo(static_cast<index_t>(rowEnd - rowStart),
+                                         static_cast<index_t>(rowStart));
 
     m_size = locInfo.first;
 
     // Copy matrix [ASSUMES square matrix, same cols/rows layout]
     // Case: Matrix already distributed
-    m_error = gismo::petsc_copySparseMat(matrix, m_pmatrix, locInfo, locInfo, m_comm);
+    PetscCallAbort(m_comm, gismo::petsc_copySparseMat(matrix, m_pmatrix, locInfo, locInfo, m_comm));
 
     //.. else
     // Assumes matrix is non-empty and fully polulated on rank 0 only !
     //petsc_distributeSparseMat(matrix, m_pmatrix, ...)
     
-    assert(0==m_error);
 
     m_isInitialized = true;
     return this->derived();
@@ -712,6 +811,8 @@ template<class Derived>
 template<typename BDerived,typename XDerived>
 void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<XDerived>& x) const
 {
+    m_lastError = 0; // clear any stale error from a previous solve
+
     Index nrhs = Index(b.cols());
     assert(m_size==b.rows());
     assert(((MatrixBase<BDerived>::Flags & RowMajorBit) == 0 || nrhs == 1) && "Row-major right hand sides are not supported");
@@ -719,32 +820,26 @@ void PetscImpl<Derived>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<X
     assert(((nrhs == 1) || b.outerStride() == b.rows()));
 
     // Copy right-hand side vector to PETSc
-    m_error = gismo::petsc_copyVec(b, m_prhs, m_comm);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( gismo::petsc_copyVec(b, m_prhs, m_comm) );
 
     this->applyOptions();
 
     // KSP set operators:
     // first: operator m_pmatrix, second: preconditionner build from the same matrix
-    m_error = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix) );
 
     // Solve the system
-    m_error = KSPSolve(this->m_ksp, m_prhs, m_psol);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( KSPSolve(this->m_ksp, m_prhs, m_psol) );
 
     // Get statistics
-    int nIter = 0;
-    m_error = KSPGetIterationNumber(this->m_ksp, &nIter);
-    assert(0==m_error);
+    PetscInt nIter = 0;
+    GISMO_PETSC_CAPTURE( KSPGetIterationNumber(this->m_ksp, &nIter) );
 
     // Copy the solution back to \a x
-    m_error = gismo::petsc_copyVecToGismo(m_psol, x, m_comm);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( gismo::petsc_copyVecToGismo(m_psol, x, m_comm) );
 
     // Clear petsc vector
-    m_error = VecZeroEntries(m_prhs);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( VecZeroEntries(m_prhs) );
 }
 
 //Note: KSP has all linear solvers, but PETSc provides also nonlinear solvers and optimizers ...
@@ -868,7 +963,7 @@ class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
     using Base::m_psol;
 
     using Base::m_size;
-    using Base::m_error;
+    using Base::m_lastError;
     using Base::m_comm;
     using Base::m_isInitialized;
     
@@ -906,14 +1001,13 @@ class PetscNestKSP : public PetscImpl< PetscNestKSP<MatrixType> >
 template<typename MatrixType>
 PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename PetscNestKSP<MatrixType>::BlockMat& matrix)
 {
+    m_lastError = 0; // clear any stale error from a previous compute()/solve() cycle
+
     if (m_isInitialized) // did we call compute before ?
     {
-        m_error = MatDestroy(&m_pmatrix);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_psol);
-        assert(0==m_error);
-        m_error = VecDestroy(&m_prhs);
-        assert(0==m_error);
+        PetscCallAbort(m_comm, MatDestroy(&m_pmatrix));
+        PetscCallAbort(m_comm, VecDestroy(&m_psol));
+        PetscCallAbort(m_comm, VecDestroy(&m_prhs));
     }
 
     int nProc = -1;
@@ -934,25 +1028,51 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
     gismo::gsVector<index_t> rsz(rBlocks);
     for (index_t r = 0 ; r!=rBlocks; ++r)
     {
+        // rsz[r] is the row count shared by every non-empty block in row r.
+        // The previous code took the last non-empty block's row count, which
+        // silently mismatched for non-square nests (1x3, 3x1). Take the first
+        // non-empty block and assert the rest agree.
+        bool rfound = false;
         for (index_t c = 0 ; c!=cBlocks; ++c)
             if (matrix(r,c).size() != 0)
-                rsz[r] = matrix(r,c).rows();       
-        m_error = gismo::petsc_computeMatLayout(rsz[r], rlocInfo[r], m_comm);
-        assert(0==m_error);
+            {
+                if (!rfound) { rsz[r] = matrix(r,c).rows(); rfound = true; }
+                else GISMO_ASSERT(matrix(r,c).rows() == rsz[r],
+                                  "PetscNestKSP::compute: blocks in the same row must share row count");
+            }
+        GISMO_ASSERT(rfound, "PetscNestKSP::compute: every row must have at least one non-empty block");
+        PetscCallAbort(m_comm, gismo::petsc_computeMatLayout(rsz[r], rlocInfo[r], m_comm));
     }
 
-    gismo::gsVector<index_t> csz(rBlocks);
+    gismo::gsVector<index_t> csz(cBlocks);
     for (index_t c = 0 ; c!=cBlocks; ++c)
     {
-        for (index_t r = 0 ; r!=cBlocks; ++r)
+        bool cfound = false;
+        for (index_t r = 0 ; r!=rBlocks; ++r)
             if (matrix(r,c).size() != 0)
-                csz[c] = matrix(r,c).cols();
-        m_error = gismo::petsc_computeMatLayout(csz[c], clocInfo[c], m_comm);
-        assert(0==m_error);
+            {
+                if (!cfound) { csz[c] = matrix(r,c).cols(); cfound = true; }
+                else GISMO_ASSERT(matrix(r,c).cols() == csz[c],
+                                  "PetscNestKSP::compute: blocks in the same column must share col count");
+            }
+        GISMO_ASSERT(cfound, "PetscNestKSP::compute: every column must have at least one non-empty block");
+        PetscCallAbort(m_comm, gismo::petsc_computeMatLayout(csz[c], clocInfo[c], m_comm));
     }
 
-    m_size = 0;
-    for (index_t c = 0 ; c!=rBlocks; ++c) m_size += csz[c];
+    // m_size is kept consistent with PetscImpl::compute's contract (local
+    // row count on this rank), here taken as the common local row count
+    // shared by every row-block (asserted below). Note BlockVec is fixed at
+    // 2 blocks (gsVector<gsMatrix<real_t>,2>), so b.rows() in
+    // PetscNestKSP::_solve_impl is the block count, not a DOF count --
+    // that override never reads m_size (each sub-block's local size is
+    // validated independently by petsc_copyVec). m_size/rows()/cols() are
+    // set here for API consistency with the base class, not because the
+    // current solve path consults them.
+    GISMO_ASSERT(rBlocks > 0, "PetscNestKSP::compute: rBlocks must be > 0");
+    m_size = rlocInfo[0].first;
+    for (index_t r = 1 ; r != rBlocks; ++r)
+        GISMO_ASSERT(rlocInfo[r].first == m_size,
+                     "PetscNestKSP::compute: row blocks must have the same local row count on every rank");
         
     std::vector<Mat> bmatrix;
     bmatrix.reserve(rBlocks*cBlocks);
@@ -962,21 +1082,17 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
             if (matrix(r,c).size() != 0)
             {
                 bmatrix.push_back(Mat());
-                m_error = MatCreate(m_comm, &bmatrix.back());
-                assert(0==m_error);
-                m_error = MatSetType(bmatrix.back(), 1 == nProc ? MATSEQAIJ : MATMPIAIJ);
-                assert(0==m_error);
-                m_error = MatSetSizes(bmatrix.back(), rlocInfo[r].first, clocInfo[c].first, rsz[r], csz[c]);
-                assert(0==m_error);
+                PetscCallAbort(m_comm, MatCreate(m_comm, &bmatrix.back()));
+                PetscCallAbort(m_comm, MatSetType(bmatrix.back(), 1 == nProc ? MATSEQAIJ : MATMPIAIJ));
+                PetscCallAbort(m_comm, MatSetSizes(bmatrix.back(), static_cast<PetscInt>(rlocInfo[r].first), static_cast<PetscInt>(clocInfo[c].first), static_cast<PetscInt>(rsz[r]), static_cast<PetscInt>(csz[c])));
             }
             else
                 bmatrix.push_back(NULL);
         }
 
-    MatCreateNest(m_comm, rBlocks, nullptr, cBlocks, nullptr,  bmatrix.data(),  &m_pmatrix);
+    MatCreateNest(m_comm, static_cast<PetscInt>(rBlocks), nullptr, static_cast<PetscInt>(cBlocks), nullptr,  bmatrix.data(),  &m_pmatrix);
     MatNestSetVecType(m_pmatrix, VECNEST);
-    m_error = MatCreateVecs(m_pmatrix, &m_psol, NULL);
-    assert(0==m_error);
+    PetscCallAbort(m_comm, MatCreateVecs(m_pmatrix, &m_psol, NULL));
 
     for (index_t r = 0 ; r!=rBlocks; ++r)
         for (index_t c = 0 ; c!=cBlocks; ++c)
@@ -984,10 +1100,8 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
             if (matrix(r,c).size() != 0)
             {
                 Mat tmp;
-                m_error = MatNestGetSubMat(m_pmatrix, r, c, &tmp);
-                assert(0==m_error);
-                m_error = gismo::petsc_copySparseMat(matrix(r,c), tmp, rlocInfo[r], clocInfo[c], m_comm);
-                assert(0==m_error);
+                PetscCallAbort(m_comm, MatNestGetSubMat(m_pmatrix, static_cast<PetscInt>(r), static_cast<PetscInt>(c), &tmp));
+                PetscCallAbort(m_comm, gismo::petsc_copySparseMat(matrix(r,c), tmp, rlocInfo[r], clocInfo[c], m_comm));
             }
         }
 
@@ -996,10 +1110,8 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
     // individual blocks are already assembled, but since they are filled "in place", the matnest stays in an unassembled state
     // KSPSolve then fails with error "Not for unassembled matrix"
     // hope that the assembly of blocks is not performed twice
-    m_error = MatAssemblyBegin( m_pmatrix, MAT_FINAL_ASSEMBLY );
-    assert(0==m_error);
-    m_error = MatAssemblyEnd( m_pmatrix, MAT_FINAL_ASSEMBLY );
-    assert(0==m_error);
+    PetscCallAbort(m_comm, MatAssemblyBegin( m_pmatrix, MAT_FINAL_ASSEMBLY ));
+    PetscCallAbort(m_comm, MatAssemblyEnd( m_pmatrix, MAT_FINAL_ASSEMBLY ));
     
     std::vector<Vec> brhs;
     brhs.reserve(rBlocks);
@@ -1009,14 +1121,12 @@ PetscNestKSP<MatrixType>& PetscNestKSP<MatrixType>::compute(const typename Petsc
         for (index_t c = 0 ; c!=cBlocks; ++c)
             if (matrix(r,c).size() != 0)
             {
-                m_error = MatCreateVecs(bmatrix[r*cBlocks+c], NULL, &brhs.back());
-                assert(0==m_error);
+                PetscCallAbort(m_comm, MatCreateVecs(bmatrix[r*cBlocks+c], NULL, &brhs.back()));
                 break;
             }
     }
 
-    m_error = VecCreateNest(m_comm, cBlocks, NULL, brhs.data(), &m_prhs);
-    assert(0==m_error);
+    PetscCallAbort(m_comm, VecCreateNest(m_comm, static_cast<PetscInt>(rBlocks), NULL, brhs.data(), &m_prhs));
 
     m_isInitialized = true;
     return *this;
@@ -1036,45 +1146,41 @@ template<class MatrixType>
 template<typename BDerived,typename XDerived>
 void PetscNestKSP<MatrixType>::_solve_impl(const MatrixBase<BDerived> &b, MatrixBase<XDerived>& x) const
 {
+    m_lastError = 0; // clear any stale error from a previous solve
+
     gsDebugVar( "Solving nest..");
 
-    // Copy right-hand side vector to PETSc   
+    // Copy right-hand side vector to PETSc
     for (index_t c = 0 ; c!=b.rows(); ++c)
     {
         Vec tmp;
-        VecNestGetSubVec(m_prhs, c, &tmp);
-        m_error = gismo::petsc_copyVec(b(c,0), tmp, m_comm);
-        assert(0==m_error);
+        VecNestGetSubVec(m_prhs, static_cast<PetscInt>(c), &tmp);
+        GISMO_PETSC_CAPTURE( gismo::petsc_copyVec(b(c,0), tmp, m_comm) );
     }
 
     this->applyOptions();
 
     // KSP set operators:
     // first: operator m_pmatrix, second: preconditionner build from the same matrix
-    m_error = KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( KSPSetOperators(this->m_ksp, m_pmatrix, m_pmatrix) );
 
     // Solve the system
-    m_error = KSPSolve(this->m_ksp, m_prhs, m_psol);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( KSPSolve(this->m_ksp, m_prhs, m_psol) );
 
     // Get statistics
-    int nIter = 0;
-    m_error = KSPGetIterationNumber(this->m_ksp, &nIter);
-    assert(0==m_error);
+    PetscInt nIter = 0;
+    GISMO_PETSC_CAPTURE( KSPGetIterationNumber(this->m_ksp, &nIter) );
 
     // Copy the solution back to \a x
     for (index_t c = 0 ; c!=b.rows(); ++c)
     {
         Vec tmp;
-        VecNestGetSubVec(m_psol, c, &tmp);
-        m_error = gismo::petsc_copyVecToGismo(tmp, x(c,0), m_comm);
-        assert(0==m_error);
+        VecNestGetSubVec(m_psol, static_cast<PetscInt>(c), &tmp);
+        GISMO_PETSC_CAPTURE( gismo::petsc_copyVecToGismo(tmp, x(c,0), m_comm) );
     }
 
     // Clear petsc vector
-    m_error = VecZeroEntries(m_prhs);
-    assert(0==m_error);
+    GISMO_PETSC_CAPTURE( VecZeroEntries(m_prhs) );
 }
 
 } // end namespace Eigen
