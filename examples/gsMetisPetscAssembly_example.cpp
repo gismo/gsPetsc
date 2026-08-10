@@ -133,15 +133,11 @@ gsMultiPatch<real_t> makeHDomain7()
 
 int main(int argc, char* argv[])
 {
-    // PetscInitialize must be first: it also initialises MPI.
-    PetscInitialize(&argc, &argv, NULL, NULL);
-    // Suppress "unused options" warnings for flags we parse ourselves via gsCmdLine.
-    PetscCall( PetscOptionsSetValue(NULL, "-options_left", "false") );
-
-    int rank = 0, nranks = 1;
-    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-    MPI_Comm_size(PETSC_COMM_WORLD, &nranks);
-
+    // The options are registered before PetscInitialize so that --help/
+    // --version can be serviced without entering PETSc/MPI at all: a binary
+    // launched directly (not via mpirun) has no MPI runtime to initialise,
+    // and on hosts where the singleton MPI runtime cannot start, calling
+    // PetscInitialize first would hang "-h" before any output is printed.
     index_t nparts = 4;
     index_t nref   = 2;
     bool    noVerify = false;
@@ -172,6 +168,36 @@ int main(int argc, char* argv[])
         "PETSc's COO API (MatSetPreallocationCOO/MatSetValuesCOO, PETSc >= "
         "3.18). No effect if built against an older PETSc, where the "
         "fallback is the only path.", noCoo);
+
+    // Pre-MPI fast path: if the user only asked for help/version, honour it
+    // on a synthetic argv (the options above are registered exactly once and
+    // render the real usage text), so unrelated PETSc options such as
+    // -ksp_rtol can never fail this parse. Stop at "--" like TCLAP's
+    // ignore_rest switch does.
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg(argv[i]);
+        if (arg == "--") break;
+        if (arg == "-h" || arg == "--help" || arg == "--version")
+        {
+            char *hargv[] = { argv[0], argv[i], NULL };
+            try { cmd.getValues(2, hargv); }
+            catch (int ret) { return ret; }
+            return 0;
+        }
+    }
+
+    // PetscInitialize must be first for the actual run: it also initialises
+    // MPI and strips PETSc-specific options from argv before the full
+    // gsCmdLine parse below.
+    PetscInitialize(&argc, &argv, NULL, NULL);
+    // Suppress "unused options" warnings for flags we parse ourselves via gsCmdLine.
+    PetscCall( PetscOptionsSetValue(NULL, "-options_left", "false") );
+
+    int rank = 0, nranks = 1;
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+    MPI_Comm_size(PETSC_COMM_WORLD, &nranks);
+
     try { cmd.getValues(argc, argv); }
     catch (int ret) { PetscFinalize(); return ret; }
 
