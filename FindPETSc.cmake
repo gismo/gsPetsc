@@ -5,14 +5,31 @@
 ## Author: H. Honnerova
 ######################################################################
 
+# PETSc comes in two layouts and both must work:
+#
+#   in-place build   PETSC_DIR/PETSC_ARCH/{include,lib}  + PETSC_DIR/include
+#                    (what `./configure && make` in a PETSc source tree gives)
+#   prefix install   PETSC_DIR/{include,lib}, no PETSC_ARCH at all
+#                    (what a package manager or an HPC module gives, e.g.
+#                     EasyBuild's PETSc/x.y.z-foss-YYYYa on SURF Snellius)
+#
+# So PETSC_ARCH is OPTIONAL: when it is absent we simply look in PETSC_DIR
+# itself. Requiring it used to make every module-provided PETSc fail the
+# find_package(PETSc REQUIRED) in gsPetsc/CMakeLists.txt.
 if(NOT DEFINED PETSC_DIR OR PETSC_DIR STREQUAL "")
-    set(PETSC_DIR "PETSC_DIR-NOTFOUND" CACHE STRING "Path to PETSc root directory")
-    message(WARNING "PETSC_DIR is not set! Please specify the path to PETSc root directory.")
+    # $PETSC_DIR is set by a source build; $EBROOTPETSC by an EasyBuild module.
+    if(DEFINED ENV{PETSC_DIR} AND NOT "$ENV{PETSC_DIR}" STREQUAL "")
+        set(PETSC_DIR "$ENV{PETSC_DIR}" CACHE STRING "Path to PETSc root directory")
+    elseif(DEFINED ENV{EBROOTPETSC} AND NOT "$ENV{EBROOTPETSC}" STREQUAL "")
+        set(PETSC_DIR "$ENV{EBROOTPETSC}" CACHE STRING "Path to PETSc root directory")
+    else()
+        set(PETSC_DIR "PETSC_DIR-NOTFOUND" CACHE STRING "Path to PETSc root directory")
+        message(WARNING "PETSC_DIR is not set! Please specify the path to PETSc root directory.")
+    endif()
 endif()
 
-if(NOT DEFINED PETSC_ARCH OR PETSC_ARCH STREQUAL "")
-    set(PETSC_ARCH "PETSC_ARCH-NOTFOUND" CACHE STRING "PETSc architecture (e.g., arch-linux-c-debug)")
-    message(WARNING "PETSC_ARCH is not set! Please specify the correct PETSc build architecture.")
+if(NOT DEFINED PETSC_ARCH)
+    set(PETSC_ARCH "$ENV{PETSC_ARCH}" CACHE STRING "PETSc architecture (empty for a prefix install)")
 endif()
 
 unset(PETSC_INCLUDES CACHE)
@@ -26,9 +43,12 @@ find_path(PETSC_INCLUDE_SRC
     ${INCLUDE_INSTALL_DIR}
     )
 
+# petscconf.h lives under PETSC_ARCH for an in-place build and directly in
+# include/ for a prefix install -- try both, in that order.
 find_path(PETSC_INCLUDE_ARCH
     NAMES petscconf.h
     PATHS ${PETSC_DIR}/${PETSC_ARCH}/include
+    ${PETSC_DIR}/include
     ${INCLUDE_INSTALL_DIR}
     )
 
@@ -41,7 +61,9 @@ MESSAGE(STATUS "Found PETSc include: ${PETSC_INCLUDES}")
   
 find_library(PETSC_LIBRARY
     NAMES petsc
-    PATHS ${PETSC_DIR}/${PETSC_ARCH}/lib ${LIB_INSTALL_DIR}
+    PATHS ${PETSC_DIR}/${PETSC_ARCH}/lib ${PETSC_DIR}/lib
+    ${PETSC_DIR}/${PETSC_ARCH}/lib64 ${PETSC_DIR}/lib64
+    ${LIB_INSTALL_DIR}
     )
   
 include(FindPackageHandleStandardArgs)
