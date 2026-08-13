@@ -26,7 +26,11 @@
     Geometry, basis, DOF mapper, element graph and METIS labelling are
     replicated on every rank. METIS runs once (rank 0) and the labels are
     broadcast, so ownership and the global permutation are then recomputed
-    identically everywhere without communication. Each rank assembles ONE
+    identically everywhere without communication. That description applies to
+    --partitioner metis; the graph-free strategies (rcb -- the default --,
+    hilbert and morton) build no element graph and need no broadcast at all,
+    because their orderings are total and every rank recomputes the same
+    labels from the replicated data. Each rank assembles ONE
     combined subdomain (the union of its partitions) with gismo's global DOF
     indexing untouched, and insertion through the permutation is what places
     the entries into the partitioned PETSc row layout.
@@ -88,6 +92,12 @@ int main(int argc, char* argv[])
 
     PetscInitialize(&argc, &argv, NULL, NULL);
     PetscCall( PetscOptionsSetValue(NULL, "-options_left", "false") );
+    // Prerequisite for PetscMemoryGetMaximumUsage() (the GAMG bracket printed
+    // under --memReport): without this call that function silently reads 0,
+    // which would make the solver look free instead of reporting "not
+    // measured". Called unconditionally (cheap, no /proc or MPI cost) since
+    // --memReport is not parsed until cmd.getValues() below.
+    PetscCall( PetscMemorySetGetMaximumUsage() );
 
     int rank = 0, nranks = 1;
     MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
@@ -116,7 +126,7 @@ int main(int argc, char* argv[])
     double rssBaseMB = 0, rssBaseSumMB = 0;
     reduceRss(comm, rssBaseMB, rssBaseSumMB);
 
-    PhaseTimer timer(comm);
+    PhaseTimer timer(comm, o.memReport);
 
     // -----------------------------------------------------------------------
     // Geometry and basis (replicated on every rank)
@@ -198,7 +208,7 @@ int main(int argc, char* argv[])
     const index_t nElems = static_cast<index_t>(mb.domain()->numElements());
 
     // -----------------------------------------------------------------------
-    // METIS partitioning: rank 0 runs it, everyone else only builds the graph.
+    // Partitioning (--partitioner) + DOF ownership. See buildPartition().
     // -----------------------------------------------------------------------
     const index_t nparts = (o.nparts > 0) ? o.nparts
                                           : math::max((index_t)1, o.partsPerRank * (index_t)nranks);
@@ -206,23 +216,13 @@ int main(int argc, char* argv[])
         "nparts ("<<nparts<<") exceeds the element count ("<<nElems<<"): "
         "refine further (-r) or use fewer ranks/partitions.");
 
-    gsMetisPartitioner<real_t>::Options partOpts;
-    partOpts.storeElementDofs = true;   // required by makeDofMapper()
-    partOpts.contiguous       = o.metisContig;
-    partOpts.weightByDofs     = o.metisWeightDofs;
-    partOpts.imbalance        = o.metisImbalance;
+    const PartitionResult part = buildPartition(o, mp, mb, u.mapper(), nparts,
+                                                nElems, rank, (index_t)nranks,
+                                                timer, comm);
 
-    timer.tic("metis");
-    gsMetisPartitioner<real_t> partitioner(mb, u.mapper(), nparts, partOpts);
-    partitionAndBroadcast(partitioner, nElems, rank, comm);
-    timer.toc();
-
-    // DOF ownership + global permutation, recomputed identically on every rank.
-    timer.tic("ownership");
-    const gsPartitionedDofMapper dofMap = partitioner.makeDofMapper(nranks);
-    const gsVector<index_t>&     perm   = dofMap.permutation();
-    typename gsDomain<real_t>::Ptr rankDomain = partitioner.subdomainForRank(rank, nranks);
-    timer.toc();
+    const gsPartitionedDofMapper&  dofMap     = part.dofMap;
+    const gsVector<index_t>&       perm       = dofMap.permutation();
+    typename gsDomain<real_t>::Ptr rankDomain = part.rankDomain;
 
     const index_t nOwned    = dofMap.numOwnedDofs(rank);
     const index_t nRankElem = static_cast<index_t>(rankDomain->numElements());
@@ -263,11 +263,17 @@ int main(int argc, char* argv[])
     const index_t localNnz = A.matrix().nonZeros();
 
     timer.tic("insert");
+    // Fresh for every measured call: the insertion helpers never reset it, so
+    // a reused instance would silently report a previous call's numbers.
+    // Only measured (non-NULL) under --memReport -- the helpers skip all
+    // internal sampling when memOut is NULL, so this costs nothing otherwise.
+    gsPetscInsertMemory insMem;
+    gsPetscInsertMemory* insMemOut = o.memReport ? &insMem : NULL;
 #if PETSC_VERSION_GE(3,18,0)
-    if (useCoo) petsc_insertSparseMatrixCOO(K, A.matrix(), perm);
-    else        petsc_insertSparseMatrixPermuted(K, A.matrix(), perm);
+    if (useCoo) petsc_insertSparseMatrixCOO(K, A.matrix(), perm, insMemOut);
+    else        petsc_insertSparseMatrixPermuted(K, A.matrix(), perm, ADD_VALUES, insMemOut);
 #else
-    petsc_insertSparseMatrixPermuted(K, A.matrix(), perm);
+    petsc_insertSparseMatrixPermuted(K, A.matrix(), perm, ADD_VALUES, insMemOut);
 #endif
     petsc_insertVectorPermuted(b, A.rhs(), perm);
     timer.toc();
@@ -284,16 +290,105 @@ int main(int argc, char* argv[])
     double rssMaxMB = 0, rssSumMB = 0;
     reduceRss(comm, rssMaxMB, rssSumMB);
 
+    // --memReport block (B): the mat_assembly boundary is the "everything
+    // live" point identified by the comment above, so this is where the
+    // named byte budget is filled and printed.
+    if (o.memReport)
+    {
+        MemBudget budget;
+        budget.add("fiber_ptrs", (double)A.fiberMatrix().fiberPointerBytes());
+        budget.add("fiber_data", (double)A.fiberMatrix().fiberDataBytes());
+        budget.add("csc_matrix", sparseMatrixBytes(A.matrix()));
+
+        addPetscMatBudget(budget, K, nOwned, comm);
+
+        PetscInt bLoc = 0, xLoc = 0;
+        PetscCall( VecGetLocalSize(b, &bLoc) );
+        PetscCall( VecGetLocalSize(x, &xLoc) );
+        budget.add("petsc_vecs", (double)(bLoc + xLoc) * (double)sizeof(PetscScalar));
+
+        budget.add("dofmapper",           (double)u.mapper().nBytes());
+        budget.add("partitioned_mapper",  (double)dofMap.nBytes());
+
+        // insert_transient reports the CAPACITY of whichever insertion
+        // path's transient buffers ran (COO triplets or the RowMajor copy).
+        // insert_peak_rise is the separately OBSERVED VmHWM rise while those
+        // buffers were alive -- on the permuted (--no-coo) path this is the
+        // only figure that also sees Eigen's storage-order-conversion
+        // allocations, which transientBytes cannot; see gsPetscInsertMemory's
+        // doc. A 0 rise is a legitimate result (transients fit under an
+        // earlier peak), not a missing measurement.
+        budget.addTransient("insert_transient", insMem.transientBytes);
+        budget.addTransient("insert_peak_rise (observed VmHWM rise during insert)",
+                            insMem.peakRssBytes - insMem.entryPeakRssBytes);
+        budget.addTransient("partitioner_lb", part.partitionerBytesLB);
+
+        budget.print(gsInfo, "mat_assembly", nDofs, localNnz, comm);
+        if (0 == rank)
+            gsInfo << "  touched fiber columns: " << touchedFiberColumns(A.matrix())
+                   << " (bounds allocator overhead: count x ~16-32 B per `new Fiber`)\n";
+    }
+
     // -----------------------------------------------------------------------
     // Solve. CG + GAMG unless overridden on the PETSc command line. Poisson
     // needs no near-null-space beyond the constant vector, which GAMG assumes
     // by default.
     // -----------------------------------------------------------------------
+    // GAMG bracket (--memReport only): PetscMemoryGetMaximumUsage is monotone
+    // process-wide, so only the delta across the solve is meaningful; sampled
+    // before/after regardless of --nosolve so the delta is honestly 0 there.
+    double gamgPreBytes = 0.0, gamgPostBytes = 0.0;
+    if (o.memReport)
+    {
+        PetscLogDouble m = 0;
+        PetscCall( PetscMemoryGetMaximumUsage(&m) );
+        gamgPreBytes = (double)m;
+    }
+
     SolveStats st;
     if (!o.noSolve)
         solveSystem(K, b, x, o.rtol, o.maxIts, st, timer, comm);
     else
     { timer.skip("ksp_setup"); timer.skip("ksp_solve"); } // keep the CSV schema fixed
+
+    if (o.memReport)
+    {
+        PetscLogDouble m = 0;
+        PetscCall( PetscMemoryGetMaximumUsage(&m) );
+        gamgPostBytes = (double)m;
+    }
+
+    // --memReport block (B), post-solve: same named lines again (K/b/x are
+    // still live), plus the GAMG bracket delta. PetscMemoryGetMaximumUsage is
+    // monotone process-wide, so only the delta below is meaningful; it must
+    // be exactly 0 under --nosolve (no solve ran) and > 0 otherwise.
+    if (o.memReport)
+    {
+        MemBudget budget;
+        budget.add("fiber_ptrs", (double)A.fiberMatrix().fiberPointerBytes());
+        budget.add("fiber_data", (double)A.fiberMatrix().fiberDataBytes());
+        budget.add("csc_matrix", sparseMatrixBytes(A.matrix()));
+
+        addPetscMatBudget(budget, K, nOwned, comm);
+
+        PetscInt bLoc = 0, xLoc = 0;
+        PetscCall( VecGetLocalSize(b, &bLoc) );
+        PetscCall( VecGetLocalSize(x, &xLoc) );
+        budget.add("petsc_vecs", (double)(bLoc + xLoc) * (double)sizeof(PetscScalar));
+
+        budget.add("dofmapper",          (double)u.mapper().nBytes());
+        budget.add("partitioned_mapper", (double)dofMap.nBytes());
+
+        budget.print(gsInfo, "post-solve", nDofs, localNnz, comm);
+
+        const double gamgLocalBytes = gamgPostBytes - gamgPreBytes;
+        double gamgMaxMB = 0.0;
+        MPI_Reduce(&gamgLocalBytes, &gamgMaxMB, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+        gamgMaxMB /= (1024.0*1024.0);
+        if (0 == rank)
+            gsInfo << "  gamg_bracket (delta, PetscMemoryGetMaximumUsage post-pre): "
+                   << std::fixed << std::setprecision(2) << gamgMaxMB << " MB\n";
+    }
 
     // -----------------------------------------------------------------------
     // Optional verification (--check): gathers the global solution on EVERY
@@ -357,6 +452,11 @@ int main(int argc, char* argv[])
     std::vector<double> tMax, tMin;
     timer.reduce(tMax, tMin);
 
+    // --memReport block (A): collective (no-op, no collective at all, when
+    // the flag is off -- see PhaseTimer::reduceMem()).
+    std::vector<double> hwmMaxMB, rssMaxMB_trace;
+    timer.reduceMem(hwmMaxMB, rssMaxMB_trace);
+
     index_t ownedMin = 0, ownedMax = 0, elemMin = 0, elemMax = 0, nnzMin = 0, nnzMax = 0;
     reduceMinMax(nOwned,    ownedMin, ownedMax, comm);
     reduceMinMax(nRankElem, elemMin,  elemMax,  comm);
@@ -375,13 +475,15 @@ int main(int argc, char* argv[])
            .add("nranks",   (index_t)nranks)
            .add("threads",  nthreads)
            .add("nparts",   nparts)
+           .add("partitioner", o.partitioner)
+           .add("part_weight", part.partWeight)
            .add("npatches", (index_t)mp.nPatches())
            .add("nref",     o.nref)
            .add("degree",   (index_t)mb.minCwiseDegree())
            .add("nelems",   nElems)
            .add("ndofs",    nDofs)
            .add("dofs_per_rank", (index_t)(nDofs / nranks))
-           .add("edgecut",  partitioner.edgeCut())
+           .add("edgecut",  part.edgeCut)
            .add("interface_dofs", nInterface)
            .add("owned_min", ownedMin)
            .add("owned_max", ownedMax)
@@ -408,6 +510,8 @@ int main(int argc, char* argv[])
         gsInfo << "\n=== Poisson METIS+PETSc scaling run ===\n";
         rec.print(gsInfo);
         gsInfo << "\n";
+
+        if (o.memReport) printMemTrace(gsInfo, timer.names(), hwmMaxMB, rssMaxMB_trace);
 
         if (!o.csv.empty()) rec.writeCsv(o.csv);
     }

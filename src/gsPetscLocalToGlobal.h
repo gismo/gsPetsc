@@ -30,8 +30,65 @@
 #include <gismo.h>
 
 #include <vector>
+#include <fstream>
+#include <string>
 
 namespace gismo {
+
+/// @brief Peak resident set size ever reached by this process, in bytes
+/// (VmHWM from /proc/self/status; 0 if unavailable).
+///
+/// Local copy of gsScalingCommon.h's rssPeakBytes(): that helper lives under
+/// optional/gsPetsc/examples/, which this optional/gsPetsc/src/ header must
+/// not include (it would invert the src/examples dependency). Task 03
+/// collapses the duplication by making gsScalingCommon.h's rssPeakBytes()
+/// forward to this function instead.
+inline double petsc_rssPeakBytes()
+{
+    std::ifstream f("/proc/self/status");
+    if (!f.good()) return 0.0;
+    std::string key;
+    while (f >> key)
+    {
+        if ("VmHWM:" == key)
+        {
+            double kb = 0;
+            f >> kb;
+            return kb * 1024.0;
+        }
+        std::getline(f, key); // skip the rest of the line
+    }
+    return 0.0;
+}
+
+/// @brief Optional out-parameter reporting the transient memory an insertion
+/// helper allocates internally. Those buffers are freed on return, so no
+/// instantaneous RSS sample outside the call can ever see them.
+///
+/// Both members are zero-initialised: a struct handed to a code path that is
+/// not taken (or never passed to any helper) reads back as exactly zero.
+struct gsPetscInsertMemory
+{
+    /// Summed capacity() bytes of the helper's internal transient buffers,
+    /// sampled while they are still alive. capacity(), not size(): the whole
+    /// point is that over-reservation must not be accounted away.
+    double transientBytes = 0.0;
+
+    /// Process peak RSS (VmHWM) in bytes, sampled on ENTRY, before this
+    /// helper has allocated anything.
+    double entryPeakRssBytes = 0.0;
+
+    /// Process peak RSS (VmHWM) in bytes, sampled inside the helper at the
+    /// moment the transient buffers are fully built.
+    ///
+    /// VmHWM is monotone since process start, so this value ALONE may be a
+    /// peak set by an earlier phase (partitioning, assembly) and say nothing
+    /// about this call. The attributable rise is
+    /// peakRssBytes - entryPeakRssBytes; a zero rise means either the
+    /// transients were small or they fitted under an earlier peak, and the
+    /// report must not claim more than that.
+    double peakRssBytes = 0.0;
+};
 
 /**
    @brief Insert a gsSparseMatrix into a PETSc distributed Mat.
@@ -119,6 +176,10 @@ int petsc_insertVector(Vec&                petscVec,
                     \a petscMat.
    @param mode      ADD_VALUES for parallel multi-partition assembly;
                     INSERT_VALUES when a single rank inserts the full matrix.
+   @param memOut    Optional out-parameter (default NULL). When non-NULL,
+                    receives the capacity bytes of this call's transient
+                    RowMajor copy and the peak-RSS samples taken at entry and
+                    once that copy is built. See gsPetscInsertMemory.
 
    @warning Assumes non-overlapping element partitions, same as
             petsc_insertSparseMatrix. Skips exact-zero stored entries
@@ -138,10 +199,26 @@ template<class T>
 int petsc_insertSparseMatrixPermuted(Mat&                      petscMat,
                                       const gsSparseMatrix<T>&  mat,
                                       const gsVector<index_t>&  perm,
-                                      InsertMode                mode = ADD_VALUES)
+                                      InsertMode                mode = ADD_VALUES,
+                                      gsPetscInsertMemory*      memOut = NULL)
 {
+    if (NULL != memOut) memOut->entryPeakRssBytes = petsc_rssPeakBytes();
+
     const gsSparseMatrix<T, RowMajor> matRow = mat;
 
+    if (NULL != memOut)
+    {
+        typedef typename gsSparseMatrix<T, RowMajor>::StorageIndex StorageIndex;
+        // Eigen's conversion-assignment above yields a *compressed* matrix,
+        // so there is no innerNonZeroPtr array to account for separately.
+        memOut->transientBytes = matRow.nonZeros() * (sizeof(T) + sizeof(StorageIndex))
+                                + (matRow.outerSize() + 1) * sizeof(StorageIndex);
+        memOut->peakRssBytes = petsc_rssPeakBytes();
+    }
+
+    // pcols/pvals below are NOT counted in transientBytes: they hold one row
+    // at a time (O(max row length), not O(nnz)), and counting them would make
+    // the permuted figure non-comparable to the COO figure's O(nnz) buffers.
     std::vector<PetscInt>    pcols;
     std::vector<PetscScalar> pvals;
     for (index_t r = 0; r < matRow.outerSize(); ++r)
@@ -216,12 +293,21 @@ int petsc_insertVectorPermuted(Vec&                       petscVec,
    for the COO path). This shrinks the triplet count handed to PETSc; the
    *contract* is unchanged -- still exactly one MatSetPreallocationCOO call
    per assembly pass, just over a (possibly smaller) fixed sparsity layout.
+
+   @param memOut  Optional out-parameter (default NULL). When non-NULL,
+                  receives the capacity bytes of this call's transient
+                  coo_i/coo_j/coo_v triplet buffers and the peak-RSS samples
+                  taken at entry and once those buffers are built. See
+                  gsPetscInsertMemory.
 */
 template<class T>
 int petsc_insertSparseMatrixCOO(Mat&                      petscMat,
                                  const gsSparseMatrix<T>&  mat,
-                                 const gsVector<index_t>&  perm)
+                                 const gsVector<index_t>&  perm,
+                                 gsPetscInsertMemory*      memOut = NULL)
 {
+    if (NULL != memOut) memOut->entryPeakRssBytes = petsc_rssPeakBytes();
+
     std::vector<PetscInt> coo_i, coo_j;
     std::vector<PetscScalar> coo_v;
     const size_t nnz = static_cast<size_t>(mat.nonZeros());
@@ -237,6 +323,17 @@ int petsc_insertSparseMatrixCOO(Mat&                      petscMat,
             coo_j.push_back(static_cast<PetscInt>(perm(it.col())));
             coo_v.push_back(static_cast<PetscScalar>(it.value()));
         }
+
+    if (NULL != memOut)
+    {
+        // capacity(), not size(): the loop above skips explicit zeros, so
+        // size() <= mat.nonZeros() while reserve(nnz) guarantees
+        // capacity() >= mat.nonZeros().
+        memOut->transientBytes = coo_i.capacity() * sizeof(PetscInt)
+                                + coo_j.capacity() * sizeof(PetscInt)
+                                + coo_v.capacity() * sizeof(PetscScalar);
+        memOut->peakRssBytes = petsc_rssPeakBytes();
+    }
 
     PetscCall( MatSetPreallocationCOO(petscMat,
                                       static_cast<PetscCount>(coo_i.size()),

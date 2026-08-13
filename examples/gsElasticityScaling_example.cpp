@@ -1,7 +1,8 @@
 /** @file gsElasticityScaling_example.cpp
 
     @brief Strong/weak scaling driver for linear elasticity, solved with a
-    METIS domain decomposition and a distributed PETSc matrix.
+    METIS or graph-free geometric domain decomposition (--partitioner) and a
+    distributed PETSc matrix.
 
     Same architecture, timing instrumentation and CSV output as
     gsPoissonScaling_example.cpp -- see that file and gsScalingCommon.h for
@@ -145,6 +146,12 @@ int main(int argc, char* argv[])
 
     PetscInitialize(&argc, &argv, NULL, NULL);
     PetscCall( PetscOptionsSetValue(NULL, "-options_left", "false") );
+    // Prerequisite for PetscMemoryGetMaximumUsage() (the GAMG bracket printed
+    // under --memReport): without this call that function silently reads 0,
+    // which would make the solver look free instead of reporting "not
+    // measured". Called unconditionally (cheap, no /proc or MPI cost) since
+    // --memReport is not parsed until cmd.getValues() below.
+    PetscCall( PetscMemorySetGetMaximumUsage() );
 
     int rank = 0, nranks = 1;
     MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
@@ -173,7 +180,7 @@ int main(int argc, char* argv[])
     double rssBaseMB = 0, rssBaseSumMB = 0;
     reduceRss(comm, rssBaseMB, rssBaseSumMB);
 
-    PhaseTimer timer(comm);
+    PhaseTimer timer(comm, o.memReport);
 
     // -----------------------------------------------------------------------
     // Geometry and basis (replicated on every rank)
@@ -303,7 +310,7 @@ int main(int argc, char* argv[])
     const index_t nElems = static_cast<index_t>(mb.domain()->numElements());
 
     // -----------------------------------------------------------------------
-    // METIS partitioning
+    // Partitioning (--partitioner) + DOF ownership. See buildPartition().
     // -----------------------------------------------------------------------
     const index_t nparts = (o.nparts > 0) ? o.nparts
                                           : math::max((index_t)1, o.partsPerRank * (index_t)nranks);
@@ -311,22 +318,13 @@ int main(int argc, char* argv[])
         "nparts ("<<nparts<<") exceeds the element count ("<<nElems<<"): "
         "refine further (-r) or use fewer ranks/partitions.");
 
-    gsMetisPartitioner<real_t>::Options partOpts;
-    partOpts.storeElementDofs = true;
-    partOpts.contiguous       = o.metisContig;
-    partOpts.weightByDofs     = o.metisWeightDofs;
-    partOpts.imbalance        = o.metisImbalance;
+    const PartitionResult part = buildPartition(o, mp, mb, u.mapper(), nparts,
+                                                nElems, rank, (index_t)nranks,
+                                                timer, comm);
 
-    timer.tic("metis");
-    gsMetisPartitioner<real_t> partitioner(mb, u.mapper(), nparts, partOpts);
-    partitionAndBroadcast(partitioner, nElems, rank, comm);
-    timer.toc();
-
-    timer.tic("ownership");
-    const gsPartitionedDofMapper dofMap = partitioner.makeDofMapper(nranks);
-    const gsVector<index_t>&     perm   = dofMap.permutation();
-    typename gsDomain<real_t>::Ptr rankDomain = partitioner.subdomainForRank(rank, nranks);
-    timer.toc();
+    const gsPartitionedDofMapper&  dofMap     = part.dofMap;
+    const gsVector<index_t>&       perm       = dofMap.permutation();
+    typename gsDomain<real_t>::Ptr rankDomain = part.rankDomain;
 
     const index_t nOwned    = dofMap.numOwnedDofs(rank);
     const index_t nRankElem = static_cast<index_t>(rankDomain->numElements());
@@ -381,11 +379,17 @@ int main(int argc, char* argv[])
     const index_t localNnz = A.matrix().nonZeros();
 
     timer.tic("insert");
+    // Fresh for every measured call: the insertion helpers never reset it, so
+    // a reused instance would silently report a previous call's numbers.
+    // Only measured (non-NULL) under --memReport -- the helpers skip all
+    // internal sampling when memOut is NULL, so this costs nothing otherwise.
+    gsPetscInsertMemory insMem;
+    gsPetscInsertMemory* insMemOut = o.memReport ? &insMem : NULL;
 #if PETSC_VERSION_GE(3,18,0)
-    if (useCoo) petsc_insertSparseMatrixCOO(K, A.matrix(), perm);
-    else        petsc_insertSparseMatrixPermuted(K, A.matrix(), perm);
+    if (useCoo) petsc_insertSparseMatrixCOO(K, A.matrix(), perm, insMemOut);
+    else        petsc_insertSparseMatrixPermuted(K, A.matrix(), perm, ADD_VALUES, insMemOut);
 #else
-    petsc_insertSparseMatrixPermuted(K, A.matrix(), perm);
+    petsc_insertSparseMatrixPermuted(K, A.matrix(), perm, ADD_VALUES, insMemOut);
 #endif
     petsc_insertVectorPermuted(b, A.rhs(), perm);
     timer.toc();
@@ -400,12 +404,57 @@ int main(int argc, char* argv[])
     double rssMaxMB = 0, rssSumMB = 0;
     reduceRss(comm, rssMaxMB, rssSumMB);
 
+    // --memReport block (B): the mat_assembly boundary is the "everything
+    // live" point (K/b/x freshly assembled, fiber matrix + CSC copy both
+    // still live), so this is where the named byte budget is filled first.
+    if (o.memReport)
+    {
+        MemBudget budget;
+        budget.add("fiber_ptrs", (double)A.fiberMatrix().fiberPointerBytes());
+        budget.add("fiber_data", (double)A.fiberMatrix().fiberDataBytes());
+        budget.add("csc_matrix", sparseMatrixBytes(A.matrix()));
+
+        addPetscMatBudget(budget, K, nOwned, comm);
+
+        PetscInt bLoc = 0, xLoc = 0;
+        PetscCall( VecGetLocalSize(b, &bLoc) );
+        PetscCall( VecGetLocalSize(x, &xLoc) );
+        budget.add("petsc_vecs", (double)(bLoc + xLoc) * (double)sizeof(PetscScalar));
+
+        budget.add("dofmapper",           (double)u.mapper().nBytes());
+        budget.add("partitioned_mapper",  (double)dofMap.nBytes());
+
+        // insert_transient reports the CAPACITY of whichever insertion
+        // path's transient buffers ran (COO triplets or the RowMajor copy).
+        // insert_peak_rise is the separately OBSERVED VmHWM rise while those
+        // buffers were alive -- on the permuted (--no-coo) path this is the
+        // only figure that also sees Eigen's storage-order-conversion
+        // allocations, which transientBytes cannot; see gsPetscInsertMemory's
+        // doc. A 0 rise is a legitimate result (transients fit under an
+        // earlier peak), not a missing measurement.
+        budget.addTransient("insert_transient", insMem.transientBytes);
+        budget.addTransient("insert_peak_rise (observed VmHWM rise during insert)",
+                            insMem.peakRssBytes - insMem.entryPeakRssBytes);
+        budget.addTransient("partitioner_lb", part.partitionerBytesLB);
+
+        budget.print(gsInfo, "mat_assembly", nDofs, localNnz, comm);
+        if (0 == rank)
+            gsInfo << "  touched fiber columns: " << touchedFiberColumns(A.matrix())
+                   << " (bounds allocator overhead: count x ~16-32 B per `new Fiber`)\n";
+    }
+
     // -----------------------------------------------------------------------
     // Rigid-body near-null-space for PCGAMG (see the file header).
     //
     // Scoped so the replicated dim x nDofs coordinate array is released as
     // soon as the (distributed) modes have been built from it.
     // -----------------------------------------------------------------------
+    // dof_geometry (--memReport only): dg is scoped INSIDE this block and
+    // does not exist at the mat_assembly boundary above, so its bytes are
+    // captured here into a variable that outlives the block. Stays exactly 0
+    // under --noRBM / --nosolve (the block below does not run) and 0 for
+    // Poisson (which never calls computeDofGeometry).
+    double dofGeometryBytes = 0.0;
     const bool useRBM = !o.noRBM && !o.noSolve;
     if (!useRBM) timer.skip("nullspace"); // keep the CSV schema fixed
     else
@@ -416,6 +465,8 @@ int main(int argc, char* argv[])
             invPerm(perm(g)) = g;
 
         const DofGeometry dg = computeDofGeometry(mp, mb, u.mapper(), dim);
+        dofGeometryBytes = (double)dg.coords.rows() * (double)dg.coords.cols() * (double)sizeof(real_t)
+                          + (double)dg.comp.capacity() * (double)sizeof(index_t);
         attachRigidBodyNullSpace(K, dg, dim, invPerm, comm);
         timer.toc();
     }
@@ -423,6 +474,17 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Solve
     // -----------------------------------------------------------------------
+    // GAMG bracket (--memReport only): see gsPoissonScaling_example.cpp for
+    // the rationale -- only the delta is meaningful, sampled before/after
+    // regardless of --nosolve so the delta is honestly 0 there.
+    double gamgPreBytes = 0.0, gamgPostBytes = 0.0;
+    if (o.memReport)
+    {
+        PetscLogDouble m = 0;
+        PetscCall( PetscMemoryGetMaximumUsage(&m) );
+        gamgPreBytes = (double)m;
+    }
+
     SolveStats st;
     real_t compliance = 0;
     if (!o.noSolve)
@@ -442,6 +504,46 @@ int main(int argc, char* argv[])
     }
     else
     { timer.skip("ksp_setup"); timer.skip("ksp_solve"); } // keep the CSV schema fixed
+
+    if (o.memReport)
+    {
+        PetscLogDouble m = 0;
+        PetscCall( PetscMemoryGetMaximumUsage(&m) );
+        gamgPostBytes = (double)m;
+    }
+
+    // --memReport block (B), post-solve: same named lines again (K/b/x are
+    // still live), plus dof_geometry (elasticity-only transient) and the GAMG
+    // bracket delta -- exactly 0 under --nosolve, > 0 otherwise.
+    if (o.memReport)
+    {
+        MemBudget budget;
+        budget.add("fiber_ptrs", (double)A.fiberMatrix().fiberPointerBytes());
+        budget.add("fiber_data", (double)A.fiberMatrix().fiberDataBytes());
+        budget.add("csc_matrix", sparseMatrixBytes(A.matrix()));
+
+        addPetscMatBudget(budget, K, nOwned, comm);
+
+        PetscInt bLoc = 0, xLoc = 0;
+        PetscCall( VecGetLocalSize(b, &bLoc) );
+        PetscCall( VecGetLocalSize(x, &xLoc) );
+        budget.add("petsc_vecs", (double)(bLoc + xLoc) * (double)sizeof(PetscScalar));
+
+        budget.add("dofmapper",          (double)u.mapper().nBytes());
+        budget.add("partitioned_mapper", (double)dofMap.nBytes());
+
+        budget.addTransient("dof_geometry", dofGeometryBytes);
+
+        budget.print(gsInfo, "post-solve", nDofs, localNnz, comm);
+
+        const double gamgLocalBytes = gamgPostBytes - gamgPreBytes;
+        double gamgMaxMB = 0.0;
+        MPI_Reduce(&gamgLocalBytes, &gamgMaxMB, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+        gamgMaxMB /= (1024.0*1024.0);
+        if (0 == rank)
+            gsInfo << "  gamg_bracket (delta, PetscMemoryGetMaximumUsage post-pre): "
+                   << std::fixed << std::setprecision(2) << gamgMaxMB << " MB\n";
+    }
 
     // -----------------------------------------------------------------------
     // Optional verification (--check): does NOT scale, see gsScalingCommon.h.
@@ -513,6 +615,11 @@ int main(int argc, char* argv[])
     std::vector<double> tMax, tMin;
     timer.reduce(tMax, tMin);
 
+    // --memReport block (A): collective (no-op, no collective at all, when
+    // the flag is off -- see PhaseTimer::reduceMem()).
+    std::vector<double> hwmMaxMB, rssMaxMB_trace;
+    timer.reduceMem(hwmMaxMB, rssMaxMB_trace);
+
     index_t ownedMin = 0, ownedMax = 0, elemMin = 0, elemMax = 0, nnzMin = 0, nnzMax = 0;
     reduceMinMax(nOwned,    ownedMin, ownedMax, comm);
     reduceMinMax(nRankElem, elemMin,  elemMax,  comm);
@@ -531,13 +638,15 @@ int main(int argc, char* argv[])
            .add("nranks",   (index_t)nranks)
            .add("threads",  nthreads)
            .add("nparts",   nparts)
+           .add("partitioner", o.partitioner)
+           .add("part_weight", part.partWeight)
            .add("npatches", (index_t)mp.nPatches())
            .add("nref",     o.nref)
            .add("degree",   (index_t)mb.minCwiseDegree())
            .add("nelems",   nElems)
            .add("ndofs",    nDofs)
            .add("dofs_per_rank", (index_t)(nDofs / nranks))
-           .add("edgecut",  partitioner.edgeCut())
+           .add("edgecut",  part.edgeCut)
            .add("interface_dofs", nInterface)
            .add("owned_min", ownedMin)
            .add("owned_max", ownedMax)
@@ -573,6 +682,8 @@ int main(int argc, char* argv[])
         gsInfo << "\n=== Linear elasticity METIS+PETSc scaling run ===\n";
         rec.print(gsInfo);
         gsInfo << "\n";
+
+        if (o.memReport) printMemTrace(gsInfo, timer.names(), hwmMaxMB, rssMaxMB_trace);
 
         if (!o.csv.empty()) rec.writeCsv(o.csv);
     }

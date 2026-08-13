@@ -1,9 +1,20 @@
 /** @file gsMetisPetscAssembly_example.cpp
 
-    @brief MPI-parallel Poisson assembly via METIS partitioning and PETSc,
+    @brief MPI-parallel Poisson assembly via element partitioning and PETSc,
     with a partitioned PETSc row layout and DOF-permuted insertion (Phase 4).
 
-    All ranks replicate the geometry, basis, and METIS partitioning (serial,
+    Two partitioners are selectable with --partitioner: "metis" (default,
+    element dual graph + METIS, gsMetisPartitioner) and the graph-free
+    geometric strategies "rcb" | "hilbert" | "morton" (gsGeometricPartitioner).
+    Every verification gate below is partitioner-AGNOSTIC -- each one compares
+    the partitioned parallel result against a full serial reference assembled
+    on every rank, and none of them inspects labels, edge cuts or part counts.
+    That makes this driver the correctness oracle for any partitioner plugged
+    into it: a new labelling strategy is validated end-to-end by running it
+    here. Note the gates are scalar (single-component space), so they cannot
+    detect component-related DOF-ownership bugs.
+
+    All ranks replicate the geometry, basis, and the partitioning (serial,
     identical on every rank). Partitions are assigned to ranks cyclically:
     rank r owns partitions { r, r+nranks, r+2*nranks, ... }. gismo's
     gsExprAssembler stays global-indexed throughout (single
@@ -36,8 +47,13 @@
       mpirun -np 4 ./bin/gsMetisPetscAssembly_example -n 4 -r 3
 
     Options:
-      -n <int>     Number of METIS partitions (default: 4)
+      -n <int>     Number of partitions       (default: 4)
       -r <int>     Global refinement levels   (default: 2)
+      --partitioner <metis|rcb|hilbert|morton>
+                   Element partitioner (default: metis). metis builds the
+                   element dual graph and calls METIS; rcb/hilbert/morton are
+                   graph-free geometric strategies (gsGeometricPartitioner)
+                   which every rank recomputes locally, without a broadcast.
       --lazyMatrix Lazy fiber-matrix columns  (default: off = eager)
       --no-coo     Force the MatSetValue fallback instead of PETSc's COO
                    insertion API (default: COO, when PETSc >= 3.18)
@@ -141,10 +157,18 @@ int main(int argc, char* argv[])
     index_t nparts = 4;
     index_t nref   = 2;
     bool    noVerify = false;
+    // Bound by reference into cmd below, so it must outlive cmd.getValues().
+    std::string partitionerName = "metis";
 
-    gsCmdLine cmd("METIS + PETSc parallel assembly verification.");
-    cmd.addInt("n", "nparts", "Number of METIS partitions", nparts);
+    gsCmdLine cmd("Partitioned (METIS or graph-free) PETSc parallel assembly verification.");
+    cmd.addInt("n", "nparts", "Number of partitions", nparts);
     cmd.addInt("r", "nref",   "Global refinement levels",   nref);
+    // Long-form only: -n and -r are taken, and an empty flag string is the
+    // documented way to register an option with no short flag.
+    cmd.addString("", "partitioner",
+        "Element partitioner: metis (default, element dual graph + METIS) | "
+        "rcb | hilbert | morton (graph-free geometric, gsGeometricPartitioner).",
+        partitionerName);
     cmd.addSwitch("noverify",
         "Skip the serial verification. The check assembles the full serial "
         "stiffness K_ser and gathers the global solution vector on EVERY rank "
@@ -275,50 +299,90 @@ int main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // METIS partitioning. Fix 5: METIS itself only needs to run once per job,
-    // not once per rank -- rank 0 calls partition() (builds the graph, then
-    // runs METIS); every other rank calls buildGraph() only (needed for
-    // makeDofMapper()/setPartLabels() below, both of which require the
-    // element graph to exist, but not for METIS's result, which arrives via
-    // the broadcast+setPartLabels() below instead).
-    // storeElementDofs=true keeps the per-element free-DOF lists the DOF
-    // mapper below needs (gsElementGraph::elementFreeDofsCSR()).
+    // Partitioning. Two paths behind --partitioner:
+    //
+    //  * metis (default): unchanged. Fix 5: METIS itself only needs to run
+    //    ONCE per job, not once per rank -- rank 0 calls partition() (builds
+    //    the element graph, then runs METIS); every other rank calls
+    //    buildGraph() only (needed for makeDofMapper()/setPartLabels() below,
+    //    both of which require the element graph to exist, but not for METIS's
+    //    result, which arrives via the broadcast+setPartLabels() instead).
+    //    storeElementDofs=true keeps the per-element free-DOF lists the DOF
+    //    mapper below needs (gsElementGraph::elementFreeDofsCSR()).
+    //
+    //  * rcb | hilbert | morton: graph-free geometric partitioning. NO element
+    //    graph and NO broadcast: every rank runs partition() and recomputes an
+    //    identical partition locally. gsGeometricPartitioner's orderings are
+    //    total (centroid coordinate, then element id), so rank-local
+    //    recomputation agrees exactly; there is no setPartLabels() path into
+    //    that class, and re-adding a broadcast would defeat the purpose.
+    //
+    // Only subdomains(), makeDofMapper() and subdomainForRank() are used
+    // downstream, and all three live on gsPartitionerBase<real_t>, so the rest
+    // of the driver -- including every verification gate -- is
+    // partitioner-agnostic and runs unchanged on both paths.
     // -----------------------------------------------------------------------
-    gsMetisPartitioner<real_t>::Options partOpts;
-    partOpts.storeElementDofs = true;
-    gsMetisPartitioner<real_t> partitioner(mb, u.mapper(), nparts, partOpts);
-    if (rank == 0)
-        partitioner.partition();
-    else
-        partitioner.buildGraph();
+    memory::unique_ptr< gsMetisPartitioner<real_t> >     metisPart;   // metis path only
+    memory::unique_ptr< gsGeometricPartitioner<real_t> > geoPart;     // graph-free path only
+    gsPartitionerBase<real_t> * partitioner = NULL;                   // non-owning view
+    index_t edgeCutValue = -1;
 
+    if (partitionerName == "metis")
     {
-        // partLabels()/edgeCut() require m_partitioned (i.e. a prior
-        // partition() call), which only rank 0 has done above -- size the
-        // buffer from the (buildGraph()-populated, on every rank) element
-        // count instead of reading partLabels() unconditionally.
-        std::vector<idx_t> labels(static_cast<size_t>(mb.domain()->numElements()));
+        gsMetisPartitioner<real_t>::Options partOpts;
+        partOpts.storeElementDofs = true;
+        metisPart.reset(new gsMetisPartitioner<real_t>(mb, u.mapper(), nparts, partOpts));
+
         if (rank == 0)
-            labels.assign(partitioner.partLabels().begin(), partitioner.partLabels().end());
-        index_t edgeCutBcast = (rank == 0) ? partitioner.edgeCut() : 0;
+            metisPart->partition();
+        else
+            metisPart->buildGraph();
 
-        MPI_Bcast(labels.data(), static_cast<int>(labels.size() * sizeof(idx_t)),
-                  MPI_BYTE, 0, PETSC_COMM_WORLD);
-        MPI_Bcast(&edgeCutBcast, static_cast<int>(sizeof(index_t)),
-                  MPI_BYTE, 0, PETSC_COMM_WORLD);
+        {
+            // partLabels()/edgeCut() require m_partitioned (i.e. a prior
+            // partition() call), which only rank 0 has done above -- size the
+            // buffer from the (buildGraph()-populated, on every rank) element
+            // count instead of reading partLabels() unconditionally.
+            std::vector<idx_t> labels(static_cast<size_t>(mb.domain()->numElements()));
+            if (rank == 0)
+                labels.assign(metisPart->partLabels().begin(), metisPart->partLabels().end());
+            index_t edgeCutBcast = (rank == 0) ? metisPart->edgeCut() : 0;
 
-        partitioner.setPartLabels(give(labels), edgeCutBcast);
+            MPI_Bcast(labels.data(), static_cast<int>(labels.size() * sizeof(idx_t)),
+                      MPI_BYTE, 0, PETSC_COMM_WORLD);
+            MPI_Bcast(&edgeCutBcast, static_cast<int>(sizeof(index_t)),
+                      MPI_BYTE, 0, PETSC_COMM_WORLD);
+
+            metisPart->setPartLabels(give(labels), edgeCutBcast);
+        }
+
+        edgeCutValue = metisPart->edgeCut();
+        partitioner  = metisPart.get();
+    }
+    else
+    {
+        // strategyFromString validates the name (and throws, identically on
+        // every rank, on anything but rcb/hilbert/morton) -- no local string
+        // table here.
+        gsGeometricPartitioner<real_t>::Options geoOpts;
+        geoOpts.strategy = gsGeometricPartitioner<real_t>::strategyFromString(partitionerName);
+        geoPart.reset(new gsGeometricPartitioner<real_t>(mp, mb, u.mapper(), nparts, geoOpts));
+        geoPart->partition();                // every rank, identical result -- no broadcast
+        edgeCutValue = geoPart->edgeCut();   // -1: graph-free, there is no edge cut
+        partitioner  = geoPart.get();
     }
 
     if (rank == 0)
-        gsInfo << "METIS edge cut: " << partitioner.edgeCut() << "\n";
-    const auto subdomains = partitioner.subdomains(); // one per partition
+        gsInfo << "partitioner: " << partitionerName
+               << "   edge cut: " << edgeCutValue << "  (-1 = graph-free)\n";
+    const auto subdomains = partitioner->subdomains(); // one per partition
 
     // DOF ownership + global permutation: computed identically on every rank
-    // from the (replicated, just-broadcast) partition labels -- no
-    // communication needed. perm(g) groups PETSc rows contiguously by
-    // owning rank, matching petsc_setupMatrixPartitioned's row layout below.
-    const gsPartitionedDofMapper dofMap = partitioner.makeDofMapper(nranks);
+    // from the replicated partition labels (broadcast on the metis path,
+    // recomputed rank-locally on the graph-free path) -- no communication
+    // needed. perm(g) groups PETSc rows contiguously by owning rank, matching
+    // petsc_setupMatrixPartitioned's row layout below.
+    const gsPartitionedDofMapper dofMap = partitioner->makeDofMapper(nranks);
     const gsVector<index_t>&     perm   = dofMap.permutation();
 
     // One combined subdomain per rank -- the union of every partition
@@ -329,9 +393,9 @@ int main(int argc, char* argv[])
     // makeDofMapper() above). Replaces the old per-partition assembly loop:
     // one setIntegrationDomain/initSystem/assemble/insert per rank instead
     // of one per owned partition.
-    typename gsDomain<real_t>::Ptr rankDomain = partitioner.subdomainForRank(rank, nranks);
+    typename gsDomain<real_t>::Ptr rankDomain = partitioner->subdomainForRank(rank, nranks);
 
-    reportRSS("after METIS partition", rank);
+    reportRSS("after partition", rank);
 
 #if PETSC_VERSION_GE(3,18,0)
     const bool useCoo = !noCoo;
