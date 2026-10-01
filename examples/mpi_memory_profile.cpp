@@ -55,7 +55,7 @@ using namespace gismo;
 
 int main(int argc, char *argv[])
 {
-    index_t dim = 2, degree = 2, numRefine = 5, numSplit = 1;
+    index_t dim = 2, degree = 2, numRefine = 5, numSplit = 1, aspect = 1;
     bool refineGeometry = false, legacy = false, csv = false, noReserve = false;
     bool lazy = false, sink = false, localNumbering = false, rendezvous = false;
     std::string partition("block");
@@ -66,6 +66,7 @@ int main(int argc, char *argv[])
     cmd.addInt   ("p", "degree",  "Spline degree", degree);
     cmd.addInt   ("r", "refine",  "Uniform h-refinement steps", numRefine);
     cmd.addInt   ("s", "split",   "Patch grid: 2^s patches per direction", numSplit);
+    cmd.addInt   ("a", "aspect",  "Multiply the patches in the last direction by this (weak scaling)", aspect);
     cmd.addString("", "partition", "Element partition: block, rcb, hilbert, morton", partition);
     cmd.addSwitch("geo", "Refine the geometry together with the basis (fine CAD / isoparametric geometry)", refineGeometry);
     cmd.addSwitch("legacy", "Also measure the conversion path of PETScSupport.h (global gsSparseMatrix + RowMajor copy)", legacy);
@@ -94,8 +95,9 @@ int main(int argc, char *argv[])
     // 1. Geometry and discretization (built identically on every rank)
     // ------------------------------------------------------------------
     const int np = 1 << numSplit;
-    gsMultiPatch<> mp = (2 == dim) ? gsNurbsCreator<>::BSplineSquareGrid(np, np, 1.0)
-                                   : gsNurbsCreator<>::BSplineCubeGrid(np, np, np, 1.0);
+    // unit patches; the exact solution vanishes on the boundary of any integer box
+    gsMultiPatch<> mp = (2 == dim) ? gsNurbsCreator<>::BSplineSquareGrid(np, np * aspect, 1.0)
+                                   : gsNurbsCreator<>::BSplineCubeGrid(np, np, np * aspect, 1.0);
     if (refineGeometry)
         for (size_t k = 0; k != mp.nPatches(); ++k)
         {
