@@ -174,3 +174,43 @@ template<class Sink, class... expr> void computePattern_into(Sink & sink, const 
 * `gsPartitionedMultiPatch`: owned + halo patches (via the replicated topology),
   only needed when geometries are fine or the patch count is very large. Output
   of the solution per rank (`.pvtu`) instead of `extract(gsMultiPatch&)`.
+
+## Status with `features/petsc-support-partitioned-dm` + sinks
+
+Variants of `mpi_memory_profile` (all give identical L2 errors):
+`block` (element block partition, PETSc equal split), `lazy` (`lazyMatrix`),
+`rcb` (`gsGeometricPartitioner` + `gsPartitionedDofMapper` ownership),
+`sink` (`computePattern_into` with `MATPREALLOCATOR`, `assemble_into` with `MatSetValues`).
+
+Peak RSS per rank, P = 4:
+
+| case | block | block+lazy | rcb+lazy | block+sink | rcb+sink |
+|---|---:|---:|---:|---:|---:|
+| 2D p=2, N = 1.05 M | 922 MiB | 649 | 577 | 445 | 450 |
+| 3D p=2, N = 275 k | 1106 MiB | 868 | 760 | 505 | 483 |
+
+rcb+sink, 2D N = 1.05 M, peak RSS per rank for P = 1/2/4/8: 1467 / 846 / 450 / 251 MiB.
+rcb+sink, 2D N = 4.2 M, P = 4: 1671 MiB per rank. With the default `initSystem` reservation, the same run was OOM-killed.
+
+Matrix entries assembled in rows owned by another rank (3D, P = 4): block 52 % of element-block
+entries, causing 161 MiB of PETSc stash per rank. With rcb it is 6 % (20 MiB of stash).
+
+### Replicated cost per global (scalar) dof, rcb+sink
+
+| object | B/dof | lifetime |
+|---|---:|---|
+| `gsDofMapper` | 4 | whole run |
+| permutation (`gsPartitionedDofMapper::permutation()`) | 4 | whole run |
+| partitioner labels/weights + ownership tables | ~20 | transient (partitioning) |
+| full solution vector for `gsFeSolution` (+ unpermuted copy) | 8 (+8) | post-processing |
+| solution `gsMultiPatch` (`extract`) | 8 | optional |
+| `lazy` without sink: fiber pointers + `m_rhs` | 16 | assembly |
+| fine (deformed) geometry | 8·d | if used |
+
+### Distributed cost per owned dof (p = 2)
+
+| | 2D | 3D |
+|---|---:|---:|
+| MATPREALLOCATOR (transient, peak) | ~520 B | ~2.2 kB |
+| final AIJ matrix | ~340 B | ~1.6 kB |
+| GAMG setup + CG | ~320 B | ~470 B |
