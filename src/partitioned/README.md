@@ -214,3 +214,39 @@ entries, causing 161 MiB of PETSc stash per rank. With rcb it is 6 % (20 MiB of 
 | MATPREALLOCATOR (transient, peak) | ~520 B | ~2.2 kB |
 | final AIJ matrix | ~340 B | ~1.6 kB |
 | GAMG setup + CG | ~320 B | ~470 B |
+
+## Weak scaling (P = 1, 2, 4; 4-core container)
+
+About 262k dofs per rank (2D, p=2) and 275k (3D, p=2): the patch grid grows with `--aspect P`.
+All variants give the same L2 error per size. GAMG needs 20–22 CG iterations in every run.
+
+Peak RSS per rank [MiB]:
+
+| variant | 2D P=1 | 2 | 4 | 3D P=1 | 2 | 4 |
+|---|---:|---:|---:|---:|---:|---:|
+| block (stable `initSystem`/`assemble`) | 518 | 681 | 929 | 2295 | 3097 | OOM-killed |
+| rcb+sink | 397 | 428 | 450 | 1574 | 1823 | 1845 |
+| rcb+local+rendezvous+sink | 417 | 445 | 448 | 1609 | 1717 | 1755 |
+| block+local+rendezvous+sink | 416 | 444 | 447 | 1608 | 1812 | 1826 |
+
+Stage wall time [s], rcb+local+rendezvous+sink:
+
+| stage | 2D P=1 | 2 | 4 | 3D P=1 | 2 | 4 |
+|---|---:|---:|---:|---:|---:|---:|
+| computePattern_into | 2.05 | 2.15 | 2.07 | 18.98 | 19.06 | 19.40 |
+| assemble_into | 2.89 | 3.03 | 3.11 | 29.08 | 30.56 | 31.99 |
+| KSP setup + solve | 1.70 | 2.51 | 2.78 | 10.16 | 11.59 | 14.39 |
+| error evaluation | 0.93 | 0.79 | 0.95 | 3.43 | 3.89 | 4.28 |
+| RCB partition (replicated) | 0.10 | 0.20 | 0.44 | 0.15 | 0.36 | 0.73 |
+| localize (scans the global mapper) | 0.35 | 0.42 | 0.43 | 0.63 | 0.79 | 0.91 |
+
+What still grows with the global size on every rank:
+
+- `gsDofMapper`: 1 → 2 → 4 MiB in 2D, i.e. 4 B per global dof.
+- RCB labels and weights: 3 → 5 → 9 MiB while partitioning, plus O(N) time on every rank.
+  The block partition with rendezvous ownership avoids the partitioner entirely.
+  In 3D it has more ghost dofs and more stash than RCB.
+- `localize`: one pass over the global mapper.
+
+The growth in KSP time comes from the cost per iteration (communication, and the
+memory bandwidth of 4 ranks on 4 cores); the iteration counts are constant.
