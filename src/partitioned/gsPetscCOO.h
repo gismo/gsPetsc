@@ -29,19 +29,23 @@ namespace gismo
 /// @param perm     optional global permutation of rows/columns
 ///                 (e.g. gsPartitionedDofMapper::permutation())
 /// @param nLocal   rows owned by this rank (PETSC_DECIDE: equal split)
+/// @param nGlobal  global number of rows (default: the size of \a fm)
 template<class T, int Major>
 PetscErrorCode petsc_matFromLocalFibers(const gsFiberMatrix<T,Major> & fm,
                                         MPI_Comm comm, Mat & A,
                                         PetscCount * nOffRank = nullptr,
                                         const gsVector<index_t> * perm = nullptr,
-                                        PetscInt nLocal = PETSC_DECIDE)
+                                        PetscInt nLocal = PETSC_DECIDE,
+                                        PetscInt nGlobal = PETSC_DETERMINE)
 {
     PetscFunctionBeginUser;
     typedef typename gsFiberMatrix<T,Major>::Fiber Fiber;
     const bool rowMajor = (Major == RowMajor);
 
     PetscCall( MatCreate(comm, &A) );
-    PetscCall( MatSetSizes(A, nLocal, nLocal, fm.rows(), fm.cols()) );
+    // with a rank-local numbering, fm is local and the global size must be given
+    if (nGlobal < 0) nGlobal = fm.rows();
+    PetscCall( MatSetSizes(A, nLocal, nLocal, nGlobal, nGlobal) );
     PetscCall( MatSetType(A, MATAIJ) );
     PetscCall( MatSetFromOptions(A) );
     PetscCall( MatSetUp(A) );

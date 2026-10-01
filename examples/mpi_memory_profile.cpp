@@ -29,6 +29,11 @@
                ones use gsGeometricPartitioner and the dof ownership of
                gsPartitionedDofMapper (PETSc rows aligned with the elements)
       --lazy   gsExprAssembler option lazyMatrix (fibers allocated on first use)
+      --local  rank-local dof numbering (gsDofMapper::localize): local
+               matrix, rhs and solution, no global vector on any rank
+      --rendezvous  (with --local) dof ownership and rows by a distributed
+               rendezvous: lowest touching rank owns a dof, no global
+               tables (gsPartitionedDofMapper is not built)
       --sink   assemble directly into PETSc (computePattern_into with a
                MATPREALLOCATOR, assemble_into with MatSetValues); no
                gismo-side matrix or rhs
@@ -42,6 +47,8 @@
 #include <gsPetsc/partitioned/gsMemoryProbe.h>
 #include <gsPetsc/partitioned/gsPetscCOO.h>
 #include <gsPetsc/partitioned/gsPetscSink.h>
+#include <gsPetsc/partitioned/gsLocalDofs.h>
+#include <gsPetsc/partitioned/gsRendezvousNumbering.h>
 #include <petscksp.h>
 
 using namespace gismo;
@@ -50,7 +57,7 @@ int main(int argc, char *argv[])
 {
     index_t dim = 2, degree = 2, numRefine = 5, numSplit = 1;
     bool refineGeometry = false, legacy = false, csv = false, noReserve = false;
-    bool lazy = false, sink = false;
+    bool lazy = false, sink = false, localNumbering = false, rendezvous = false;
     std::string partition("block");
     std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10");
 
@@ -64,11 +71,15 @@ int main(int argc, char *argv[])
     cmd.addSwitch("legacy", "Also measure the conversion path of PETScSupport.h (global gsSparseMatrix + RowMajor copy)", legacy);
     cmd.addSwitch("noreserve", "Do not reserve fiber storage in initSystem (bdA=bdB=bdO=0)", noReserve);
     cmd.addSwitch("lazy", "Allocate fibers on first use (option lazyMatrix)", lazy);
+    cmd.addSwitch("local", "Rank-local dof numbering (localized mapper)", localNumbering);
+    cmd.addSwitch("rendezvous", "Distributed dof ownership/rows (needs --local)", rendezvous);
     cmd.addSwitch("sink", "Assemble directly into PETSc (no gismo matrix/rhs)", sink);
     cmd.addSwitch("csv", "Print CSV lines (prefix CSV,) in addition to the table", csv);
     cmd.addString("o", "petsc", "PETSc options", petscOpts);
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
     GISMO_ENSURE(!(sink && legacy), "--legacy needs the gismo-side matrix, it cannot be combined with --sink");
+    GISMO_ENSURE(!rendezvous || localNumbering, "--rendezvous needs --local");
+    GISMO_ENSURE(!(localNumbering && legacy), "--legacy needs the global numbering, it cannot be combined with --local");
 
     const gsMpi & mpi = gsMpi::init(argc, argv);
     gsMpiComm comm = mpi.worldComm();
@@ -148,16 +159,38 @@ int main(int argc, char *argv[])
         part.partition();
         myDomain = part.subdomainForRank(rank, nproc);
         L.stage("element partition (" + partition + ", incl. labels)");
-        gsPartitionedDofMapper pdm = part.makeDofMapper(nproc);
-        L.stage("gsPartitionedDofMapper (incl. temporaries)");
-        L.object("  gsPartitionedDofMapper", pdm.nBytes());
-        perm = pdm.permutation();
-        nLocal = pdm.numOwnedDofs(rank);
+        if (!rendezvous)
+        {
+            gsPartitionedDofMapper pdm = part.makeDofMapper(nproc);
+            L.stage("gsPartitionedDofMapper (incl. temporaries)");
+            L.object("  gsPartitionedDofMapper", pdm.nBytes());
+            perm = pdm.permutation();
+            nLocal = pdm.numOwnedDofs(rank);
+        }
     }
     // the partitioner (element labels, weights) and the full ownership
     // tables are released here, only the permutation is kept
     L.stage("partitioner released, permutation kept");
     const gsVector<index_t> * permPtr = perm.size() ? &perm : nullptr;
+    gsVector<index_t> rowOf;             // local dof -> PETSc row (local numbering)
+    if (localNumbering)
+    {
+        if (rendezvous)
+        {
+            const std::vector<index_t> l2g = localFreeDofs(*myDomain, mb, u.mapper());
+            std::vector<index_t> rows, l2gFree(l2g);
+            for (index_t & g : l2gFree) g -= u.mapper().firstIndex();
+            nLocal = rendezvousNumbering(comm, N, l2gFree, rows);
+            rowOf = gsAsConstVector<index_t>(rows);
+            localizeSpace(u, l2g);
+        }
+        else
+            rowOf = localizeSpace(u, *myDomain, permPtr);
+        perm.resize(0);                  // the global permutation is not needed anymore
+        permPtr = &rowOf;
+        L.stage("localize mapper (local -> global rows)");
+        L.object("  local-to-global row map", rowOf.size() * sizeof(index_t));
+    }
     A.setIntegrationDomain(myDomain);
 
     // ------------------------------------------------------------------
@@ -204,7 +237,7 @@ int main(int argc, char *argv[])
         localNnz = A.fiberMatrix().nonZeros();
         tAssemble = clock.stop();
 
-        PetscCall( petsc_matFromLocalFibers(A.fiberMatrix(), comm, PA, &nOff, permPtr, nLocal) );
+        PetscCall( petsc_matFromLocalFibers(A.fiberMatrix(), comm, PA, &nOff, permPtr, nLocal, N) );
         PetscCall( petsc_vecFromLocalContributions(A.rhs(), PA, Pb, permPtr) );
         PetscCall( MatCreateVecs(PA, &Px, nullptr) );
         L.stage("PETSc Mat/Vec (COO, distributed)");
@@ -246,6 +279,16 @@ int main(int argc, char *argv[])
     clock.restart();
     // Dofs actually needed by the local elements ("owned + ghost")
     std::vector<PetscInt> needed;
+    gsMatrix<> solVector;
+    if (localNumbering)
+    {
+        // the local numbering already is the owned + ghost set
+        needed.assign(rowOf.data(), rowOf.data() + rowOf.size());
+        PetscCall( petsc_gatherEntries(Px, needed, solVector) );
+        L.stage("gather local+ghost solution entries");
+        L.object("  local+ghost solution (what is needed)", memprobe::bytesOf(solVector) + needed.size() * sizeof(PetscInt));
+    }
+    else
     {
         gsMatrix<index_t> act;
         for (auto it = myDomain->beginAll(); it != myDomain->endAll(); ++it)
@@ -262,30 +305,32 @@ int main(int argc, char *argv[])
         std::sort(needed.begin(), needed.end());
         needed.erase(std::unique(needed.begin(), needed.end()), needed.end());
         needed.shrink_to_fit();
-    }
-    gsMatrix<> ghosted;
-    PetscCall( petsc_gatherEntries(Px, needed, ghosted) );
-    L.stage("gather local+ghost solution entries");
-    L.object("  local+ghost solution (what is needed)", memprobe::bytesOf(ghosted) + needed.size() * sizeof(PetscInt));
+        gsMatrix<> ghosted;
+        PetscCall( petsc_gatherEntries(Px, needed, ghosted) );
+        L.stage("gather local+ghost solution entries");
+        L.object("  local+ghost solution (what is needed)", memprobe::bytesOf(ghosted) + needed.size() * sizeof(PetscInt));
 
-    gsMatrix<> solVector;
-    PetscCall( petsc_gatherAll(Px, solVector) );
-    if (permPtr)
-    {
-        gsMatrix<> tmp(N, 1);
-        for (index_t g = 0; g != N; ++g) tmp(g) = solVector(perm[g]);
-        solVector.swap(tmp);
+        PetscCall( petsc_gatherAll(Px, solVector) );
+        if (permPtr)
+        {
+            gsMatrix<> tmp(N, 1);
+            for (index_t g = 0; g != N; ++g) tmp(g) = solVector(perm[g]);
+            solVector.swap(tmp);
+        }
+        L.stage("gather full solution (gsFeSolution)");
+        L.object("  global solution vector", memprobe::bytesOf(solVector));
     }
-    L.stage("gather full solution (gsFeSolution)");
-    L.object("  global solution vector", memprobe::bytesOf(solVector));
 
     gsExprAssembler<>::solution u_sol = A.getSolution(u, solVector);
-    gsMultiPatch<> mpSol;
-    u_sol.extract(mpSol);
-    L.stage("solution as gsMultiPatch (extract)");
-    L.object("  solution gsMultiPatch", memprobe::bytesOf(mpSol));
-    mpSol.clear();
-    L.stage("free solution gsMultiPatch");
+    if (!localNumbering) // extract() visits all patches, i.e. needs the global vector
+    {
+        gsMultiPatch<> mpSol;
+        u_sol.extract(mpSol);
+        L.stage("solution as gsMultiPatch (extract)");
+        L.object("  solution gsMultiPatch", memprobe::bytesOf(mpSol));
+        mpSol.clear();
+        L.stage("free solution gsMultiPatch");
+    }
 
     real_t l2loc = ev.integral((u_ex - u_sol).sqNorm() * meas(G)), l2 = 0;
     MPI_Allreduce(&l2loc, &l2, 1, MPI_DOUBLE, MPI_SUM, comm);
@@ -301,6 +346,8 @@ int main(int argc, char *argv[])
     std::string variant = partition;
     if (noReserve) variant += "+noreserve";
     if (lazy)      variant += "+lazy";
+    if (localNumbering) variant += "+local";
+    if (rendezvous)     variant += "+rv";
     if (sink)      variant += "+sink";
 
     if (0 == rank)

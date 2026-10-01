@@ -14,8 +14,8 @@ for line in open(sys.argv[1]):
         rows.append(dict(var=var,P=int(P),d=int(d),p=int(p),N=int(N),patches=int(npch),geo=int(geo),nr=int(nr),
                          name=rest[0].strip(),kind=rest[1],mn=int(rest[2]),mx=int(rest[3]),sm=int(rest[4])))
 MB=1024*1024
-def table(filt, key, title):
-    sel=[r for r in rows if filt(r)]
+def table(filt, key, title, kind=None):
+    sel=[r for r in rows if filt(r) and ((r['kind']=='time') == (kind=='time'))]
     keys=sorted(set(key(r) for r in sel))
     names=[]
     for r in sel:
@@ -27,16 +27,20 @@ def table(filt, key, title):
         vals=[]
         for k in keys:
             v=[r['mx'] for r in sel if r['name']==n and key(r)==k]
-            vals.append("%.1f"%(v[0]/MB) if v else "")
+            vals.append(("%.2f"%(v[0]/1e6) if kind=='time' else "%.1f"%(v[0]/MB)) if v else "")
         print("| "+n+" | "+" | ".join(vals)+" |")
 mode=sys.argv[2] if len(sys.argv)>2 else "all"
 if mode=="variants":
     for d,lo,hi,t in [(2,1e6,2e6,"2D, p=2, N~1.05M"),(3,2e5,4e5,"3D, p=2, N~275k")]:
         table(lambda r:r['d']==d and lo<r['N']<hi and r['P']==4, lambda r:r['var'], t+", P=4, max MiB per rank by variant")
-    for v in sorted(set(r['var'] for r in rows if r['var']!='block')):
-        sel=[r for r in rows if r['var']==v and r['d']==2 and 1e6<r['N']<2e6]
-        if len(set(r['P'] for r in sel))>2:
-            table(lambda r,v=v:r['var']==v and r['d']==2 and 1e6<r['N']<2e6, lambda r:r['P'], "2D N~1.05M, "+v+", max MiB per rank vs P")
+        table(lambda r:r['d']==d and lo<r['N']<hi and r['P']==4, lambda r:r['var'], t+", P=4, stage wall time [s] by variant", 'time')
+    for d,lo,hi,t in [(2,1e6,2e6,"2D N~1.05M"),(3,2e5,4e5,"3D N~275k")]:
+        for v in sorted(set(r['var'] for r in rows)):
+            sel=[r for r in rows if r['var']==v and r['d']==d and lo<r['N']<hi]
+            if len(set(r['P'] for r in sel))>2:
+                f=lambda r,v=v,d=d,lo=lo,hi=hi:r['var']==v and r['d']==d and lo<r['N']<hi
+                table(f, lambda r:r['P'], t+", "+v+", max MiB per rank vs P")
+                table(f, lambda r:r['P'], t+", "+v+", stage wall time [s] vs P", 'time')
     sys.exit(0)
 table(lambda r:r['d']==2 and r['N']>1e6 and r['N']<2e6 and r['patches']==4 and not r['geo'] and r['p']==2 and not r['nr'], lambda r:r['P'], "2D, p=2, N~1.05M, max MiB per rank vs P")
 table(lambda r:r['d']==3 and r['N']>2e5 and r['N']<4e5 and not r['geo'] and r['p']==2 and not r['nr'], lambda r:r['P'], "3D, p=2, N~275k, max MiB per rank vs P")

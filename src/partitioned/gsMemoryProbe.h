@@ -125,12 +125,13 @@ struct Entry
     std::string name;
     long long   value; // bytes (or a count)
     bool        isStage; // true: heap delta of a stage, false: object estimate
+    double      seconds; // wall time of a stage (stages are separated by barriers)
 };
 
 class Ledger
 {
 public:
-    explicit Ledger(MPI_Comm comm) : m_comm(comm), m_last(heapBytes())
+    explicit Ledger(MPI_Comm comm) : m_comm(comm), m_last(heapBytes()), m_lastTime(MPI_Wtime())
     {
         MPI_Comm_rank(comm, &m_rank);
         MPI_Comm_size(comm, &m_size);
@@ -142,13 +143,15 @@ public:
     {
         MPI_Barrier(m_comm);
         const long long now = heapBytes();
-        m_entries.push_back({name, now - m_last, true});
+        const double t = MPI_Wtime();
+        m_entries.push_back({name, now - m_last, true, t - m_lastTime});
         m_last = now;
+        m_lastTime = t;
     }
 
     /// Records an object size estimate
     void object(const std::string & name, long long bytes)
-    { m_entries.push_back({name, bytes, false}); }
+    { m_entries.push_back({name, bytes, false, 0.0}); }
 
     long long heapSinceStart() const { return heapBytes() - m_base; }
 
@@ -170,7 +173,7 @@ public:
         os << "\n" << std::left << std::setw(46) << ("[" + tag + "] (MiB, over "
               + std::to_string(m_size) + " ranks)")
            << std::right << std::setw(10) << "min" << std::setw(10) << "max"
-           << std::setw(10) << "sum" << std::setw(8) << "max/sum" << "\n";
+           << std::setw(10) << "sum" << std::setw(8) << "max/sum" << std::setw(9) << "time[s]" << "\n";
         for (int i = 0; i != n; ++i)
         {
             const double ratio = vsum[i] != 0 ? static_cast<double>(vmax[i]) / vsum[i] : 0.;
@@ -178,7 +181,10 @@ public:
                << ((m_entries[i].isStage ? "  stage  " : "  object ") + m_entries[i].name)
                << std::right << std::fixed << std::setprecision(2)
                << std::setw(10) << mb(vmin[i]) << std::setw(10) << mb(vmax[i])
-               << std::setw(10) << mb(vsum[i]) << std::setw(8) << ratio << "\n";
+               << std::setw(10) << mb(vsum[i]) << std::setw(8) << ratio;
+            if (m_entries[i].isStage)
+                os << std::setw(9) << std::setprecision(3) << m_entries[i].seconds;
+            os << "\n";
         }
         os << "  peak RSS (max over ranks): " << mb(peakMax) << " MiB\n";
         os.unsetf(std::ios::fixed);
@@ -195,15 +201,24 @@ public:
         MPI_Reduce(v.data(), vsum.data(), n, MPI_LONG_LONG, MPI_SUM, 0, m_comm);
         if (0 != m_rank) return;
         for (int i = 0; i != n; ++i)
+        {
             os << tag << "," << m_entries[i].name << ","
                << (m_entries[i].isStage ? "stage" : "object") << ","
                << vmin[i] << "," << vmax[i] << "," << vsum[i] << "\n";
+            if (m_entries[i].isStage) // wall time in microseconds
+            {
+                const long long us = static_cast<long long>(1e6 * m_entries[i].seconds);
+                os << tag << "," << m_entries[i].name << ",time,"
+                   << us << "," << us << "," << us << "\n";
+            }
+        }
     }
 
 private:
     MPI_Comm m_comm;
     int m_rank, m_size;
     long long m_base, m_last;
+    double m_lastTime;
     std::vector<Entry> m_entries;
 };
 

@@ -11,8 +11,9 @@
     which defines the PETSc row ownership. Negative indices are ignored
     by PETSc.
 
-    The sinks are called from all OpenMP threads of the assembler and
-    serialize the PETSc calls with a critical section.
+    The sinks are called from all OpenMP threads of the assembler. The
+    system sink buffers per thread and passes the buffers to PETSc in a
+    critical section; the pattern sink serializes every call.
 
     This file is part of the G+Smo library.
 
@@ -25,6 +26,9 @@
 
 #include <petscmat.h>
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace gismo
 {
@@ -105,55 +109,90 @@ private:
 /// @brief Adds element blocks to a PETSc matrix and right-hand side vector
 /// (ADD_VALUES; entries of rows owned by other ranks are communicated at
 /// assembly()).
+///
+/// Every OpenMP thread collects its element blocks in its own buffer; a
+/// buffer is passed to PETSc (under a critical section, PETSc is not
+/// thread-safe) when it exceeds flushBytes and in assembly().
 class gsPetscSystemSink
 {
+    struct Buffer
+    {
+        std::vector<PetscInt>    mIdx;  // per block: nr, nc, rows, cols
+        std::vector<PetscScalar> mVal;  // per block: nr*nc values (column-major)
+        std::vector<PetscInt>    vIdx;  // rhs rows
+        std::vector<PetscScalar> vVal;  // rhs values
+        PetscCount offRank = 0;
+        size_t bytes() const
+        {
+            return (mIdx.size() + vIdx.size()) * sizeof(PetscInt) +
+                   (mVal.size() + vVal.size()) * sizeof(PetscScalar);
+        }
+    };
+
 public:
-    gsPetscSystemSink(Mat A, Vec b, const gsVector<index_t> * perm = nullptr)
-    : m_A(A), m_b(b), m_perm(perm), m_offRank(0)
+    gsPetscSystemSink(Mat A, Vec b, const gsVector<index_t> * perm = nullptr,
+                      size_t flushBytes = size_t(1) << 22)
+    : m_A(A), m_b(b), m_perm(perm), m_flushBytes(flushBytes)
     {
         // gsMatrix blocks are column-major
         PetscCallAbort(PETSC_COMM_SELF, MatSetOption(m_A, MAT_ROW_ORIENTED, PETSC_FALSE));
         // non-free dofs are passed as -1 (AIJ ignores them by default, Vec does not)
         PetscCallAbort(PETSC_COMM_SELF, VecSetOption(m_b, VEC_IGNORE_NEGATIVE_INDICES, PETSC_TRUE));
         PetscCallAbort(PETSC_COMM_SELF, MatGetOwnershipRange(m_A, &m_rs, &m_re));
+#ifdef _OPENMP
+        m_buf.resize(omp_get_max_threads());
+#else
+        m_buf.resize(1);
+#endif
     }
 
     /// Number of matrix entries passed so far in rows owned by other ranks
     /// (these go through the PETSc stash)
-    PetscCount offRankEntries() const { return m_offRank; }
+    PetscCount offRankEntries() const
+    {
+        PetscCount n = 0;
+        for (const Buffer & b : m_buf) n += b.offRank;
+        return n;
+    }
 
     template<class T>
     void addMatrix(const gsVector<index_t> & rows, const gsVector<index_t> & cols,
                    const gsMatrix<T> & block)
     {
-#       pragma omp critical (gsPetscSink)
+        Buffer & B = buffer();
+        const index_t nr = rows.size(), nc = cols.size();
+        B.mIdx.push_back(nr);
+        B.mIdx.push_back(nc);
+        for (index_t i = 0; i != nr; ++i)
         {
-            petsc_sink_detail::mapIndices(rows, m_perm, m_r);
-            petsc_sink_detail::mapIndices(cols, m_perm, m_c);
-            for (PetscInt r : m_r)
-                if (r >= 0 && (r < m_rs || r >= m_re)) m_offRank += m_c.size();
-            PetscCallAbort(PETSC_COMM_SELF,
-                MatSetValues(m_A, m_r.size(), m_r.data(), m_c.size(), m_c.data(),
-                             block.data(), ADD_VALUES));
+            const PetscInt r = map(rows[i]);
+            B.mIdx.push_back(r);
+            if (r >= 0 && (r < m_rs || r >= m_re)) B.offRank += nc;
         }
+        for (index_t j = 0; j != nc; ++j) B.mIdx.push_back(map(cols[j]));
+        B.mVal.insert(B.mVal.end(), block.data(), block.data() + nr * nc);
+        if (B.bytes() > m_flushBytes) flush(B);
     }
 
     template<class T>
     void addRhs(const gsVector<index_t> & rows, const gsMatrix<T> & block)
     {
         GISMO_ASSERT(1 == block.cols(), "Only a single right-hand side is supported.");
-#       pragma omp critical (gsPetscSink)
+        Buffer & B = buffer();
+        for (index_t i = 0; i != rows.size(); ++i)
         {
-            petsc_sink_detail::mapIndices(rows, m_perm, m_r);
-            PetscCallAbort(PETSC_COMM_SELF,
-                VecSetValues(m_b, m_r.size(), m_r.data(), block.data(), ADD_VALUES));
+            B.vIdx.push_back(map(rows[i]));
+            B.vVal.push_back(block(i, 0));
         }
+        if (B.bytes() > m_flushBytes) flush(B);
     }
 
-    /// Communicates the off-rank contributions (collective)
+    /// Passes the remaining buffers to PETSc and communicates the off-rank
+    /// contributions (collective; call outside of parallel regions)
     PetscErrorCode assembly()
     {
         PetscFunctionBeginUser;
+        for (Buffer & B : m_buf) flush(B);
         PetscCall( MatAssemblyBegin(m_A, MAT_FINAL_ASSEMBLY) );
         PetscCall( VecAssemblyBegin(m_b) );
         PetscCall( MatAssemblyEnd  (m_A, MAT_FINAL_ASSEMBLY) );
@@ -162,12 +201,45 @@ public:
     }
 
 private:
+    Buffer & buffer()
+    {
+#ifdef _OPENMP
+        return m_buf[omp_get_thread_num()];
+#else
+        return m_buf[0];
+#endif
+    }
+
+    PetscInt map(index_t i) const
+    { return (i < 0) ? -1 : static_cast<PetscInt>(m_perm ? (*m_perm)[i] : i); }
+
+    void flush(Buffer & B)
+    {
+#       pragma omp critical (gsPetscSink)
+        {
+            const PetscScalar * v = B.mVal.data();
+            for (size_t k = 0; k < B.mIdx.size(); )
+            {
+                const PetscInt nr = B.mIdx[k], nc = B.mIdx[k+1];
+                const PetscInt * r = &B.mIdx[k+2];
+                PetscCallAbort(PETSC_COMM_SELF,
+                    MatSetValues(m_A, nr, r, nc, r + nr, v, ADD_VALUES));
+                v += nr * nc;
+                k += 2 + nr + nc;
+            }
+            if (!B.vIdx.empty())
+                PetscCallAbort(PETSC_COMM_SELF,
+                    VecSetValues(m_b, B.vIdx.size(), B.vIdx.data(), B.vVal.data(), ADD_VALUES));
+        }
+        B.mIdx.clear(); B.mVal.clear(); B.vIdx.clear(); B.vVal.clear();
+    }
+
     Mat m_A;
     Vec m_b;
     const gsVector<index_t> * m_perm;
+    size_t m_flushBytes;
     PetscInt m_rs, m_re;
-    PetscCount m_offRank;
-    std::vector<PetscInt> m_r, m_c;
+    std::vector<Buffer> m_buf;
 };
 
 } // namespace gismo
