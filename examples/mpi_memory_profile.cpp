@@ -24,14 +24,24 @@
     License, v. 2.0. If a copy of the MPL was not distributed with this
     file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+    Variants:
+      --partition block|rcb|hilbert|morton  element partition; the geometric
+               ones use gsGeometricPartitioner and the dof ownership of
+               gsPartitionedDofMapper (PETSc rows aligned with the elements)
+      --lazy   gsExprAssembler option lazyMatrix (fibers allocated on first use)
+      --sink   assemble directly into PETSc (computePattern_into with a
+               MATPREALLOCATOR, assemble_into with MatSetValues); no
+               gismo-side matrix or rhs
+
     Example run:
-    mpirun -np 4 ./bin/mpi_memory_profile -r 7 -p 2 -s 1
+    mpirun -np 4 ./bin/mpi_memory_profile -r 7 -p 2 -s 1 --partition rcb --sink
 */
 
 #include <gismo.h>
 #include <gsPetsc/partitioned/gsElementRangeDomain.h>
 #include <gsPetsc/partitioned/gsMemoryProbe.h>
 #include <gsPetsc/partitioned/gsPetscCOO.h>
+#include <gsPetsc/partitioned/gsPetscSink.h>
 #include <petscksp.h>
 
 using namespace gismo;
@@ -40,6 +50,8 @@ int main(int argc, char *argv[])
 {
     index_t dim = 2, degree = 2, numRefine = 5, numSplit = 1;
     bool refineGeometry = false, legacy = false, csv = false, noReserve = false;
+    bool lazy = false, sink = false;
+    std::string partition("block");
     std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10");
 
     gsCmdLine cmd("Memory profile of element-partitioned assembly with gsExprAssembler + PETSc.");
@@ -47,12 +59,16 @@ int main(int argc, char *argv[])
     cmd.addInt   ("p", "degree",  "Spline degree", degree);
     cmd.addInt   ("r", "refine",  "Uniform h-refinement steps", numRefine);
     cmd.addInt   ("s", "split",   "Patch grid: 2^s patches per direction", numSplit);
+    cmd.addString("", "partition", "Element partition: block, rcb, hilbert, morton", partition);
     cmd.addSwitch("geo", "Refine the geometry together with the basis (fine CAD / isoparametric geometry)", refineGeometry);
     cmd.addSwitch("legacy", "Also measure the conversion path of PETScSupport.h (global gsSparseMatrix + RowMajor copy)", legacy);
     cmd.addSwitch("noreserve", "Do not reserve fiber storage in initSystem (bdA=bdB=bdO=0)", noReserve);
+    cmd.addSwitch("lazy", "Allocate fibers on first use (option lazyMatrix)", lazy);
+    cmd.addSwitch("sink", "Assemble directly into PETSc (no gismo matrix/rhs)", sink);
     cmd.addSwitch("csv", "Print CSV lines (prefix CSV,) in addition to the table", csv);
     cmd.addString("o", "petsc", "PETSc options", petscOpts);
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
+    GISMO_ENSURE(!(sink && legacy), "--legacy needs the gismo-side matrix, it cannot be combined with --sink");
 
     const gsMpi & mpi = gsMpi::init(argc, argv);
     gsMpiComm comm = mpi.worldComm();
@@ -93,13 +109,8 @@ int main(int argc, char *argv[])
     L.stage("gsBoundaryConditions");
 
     // ------------------------------------------------------------------
-    // 2. Element partition and assembler
+    // 2. Spaces, element partition and dof ownership
     // ------------------------------------------------------------------
-    gsDomain<>::Ptr fullDomain = mb.domain();
-    gsDomain<>::Ptr myDomain = gsElementRangeDomain<real_t>::blockPartition(fullDomain, rank, nproc);
-    const index_t numElemGlobal = fullDomain->numElements();
-    L.stage("element partition (gsDomain)");
-
     gsExprAssembler<> A(1,1);
     if (noReserve)
     {
@@ -107,7 +118,7 @@ int main(int argc, char *argv[])
         A.options().setInt ("bdB", 0);
         A.options().setReal("bdO", 0);
     }
-    A.setIntegrationDomain(myDomain);
+    if (lazy) A.options().setSwitch("lazyMatrix", true);
     gsExprEvaluator<> ev(A);
     gsExprAssembler<>::geometryMap G = A.getMap(mp);
     gsExprAssembler<>::space u = A.getSpace(mb);
@@ -115,56 +126,111 @@ int main(int argc, char *argv[])
     auto u_ex = ev.getVariable(ms, G);
 
     u.setup(bc, dirichlet::interpolation, 0);
+    const index_t N = u.mapper().freeSize();
     L.stage("space setup (gsDofMapper + Dirichlet)");
     L.object("  gsDofMapper", memprobe::bytesOf(u.mapper()));
     L.object("  fixed (Dirichlet) dofs", memprobe::bytesOf(u.fixedPart()));
 
-    A.initSystem();
-    const index_t N = A.numDofs();
-    L.stage("initSystem (fiber matrix + rhs)");
-    L.object("  gsFiberMatrix after initSystem", memprobe::bytesOf(A.fiberMatrix()));
-    L.object("  rhs vector", memprobe::bytesOf(A.rhs()));
-
-    A.computePattern(igrad(u, G) * igrad(u, G).tr());
-    L.stage("computePattern (local elements)");
-
-    A.assemble(igrad(u, G) * igrad(u, G).tr() * meas(G), u * ff * meas(G));
-    L.stage("assemble (local elements)");
-    L.object("  gsFiberMatrix after assembly", memprobe::bytesOf(A.fiberMatrix()));
-    const long long localNnz = A.fiberMatrix().nonZeros();
-    const double tAssemble = clock.stop();
+    const index_t numElemGlobal = mb.domain()->numElements();
+    gsDomain<>::Ptr myDomain;
+    gsVector<index_t> perm;              // global dof -> PETSc row (empty: identity)
+    PetscInt nLocal = PETSC_DECIDE;      // PETSc rows owned by this rank
+    if ("block" == partition)
+    {
+        myDomain = gsElementRangeDomain<real_t>::blockPartition(mb.domain(), rank, nproc);
+        L.stage("element partition (block)");
+    }
+    else
+    {
+        gsGeometricPartitioner<real_t>::Options popt;
+        popt.strategy = gsGeometricPartitioner<real_t>::strategyFromString(partition);
+        gsGeometricPartitioner<real_t> part(mp, mb, u.mapper(), nproc, popt);
+        part.partition();
+        myDomain = part.subdomainForRank(rank, nproc);
+        L.stage("element partition (" + partition + ", incl. labels)");
+        gsPartitionedDofMapper pdm = part.makeDofMapper(nproc);
+        L.stage("gsPartitionedDofMapper (incl. temporaries)");
+        L.object("  gsPartitionedDofMapper", pdm.nBytes());
+        perm = pdm.permutation();
+        nLocal = pdm.numOwnedDofs(rank);
+    }
+    // the partitioner (element labels, weights) and the full ownership
+    // tables are released here, only the permutation is kept
+    L.stage("partitioner released, permutation kept");
+    const gsVector<index_t> * permPtr = perm.size() ? &perm : nullptr;
+    A.setIntegrationDomain(myDomain);
 
     // ------------------------------------------------------------------
-    // 3. Transfer to PETSc and solve
+    // 3. Assembly, transfer to PETSc and solve
     // ------------------------------------------------------------------
-    clock.restart();
     Mat PA; Vec Pb, Px; KSP ksp;
     PetscCount nOff = 0;
-    PetscCall( petsc_matFromLocalFibers(A.fiberMatrix(), comm, PA, &nOff) );
-    PetscCall( petsc_vecFromLocalContributions(A.rhs(), PA, Pb) );
-    L.stage("PETSc Mat/Vec (COO, distributed)");
-
-    if (legacy)
+    long long localNnz = 0;
+    double tAssemble = 0;
+    if (sink)
     {
-        // What PETScSupport.h::petsc_copySparseMat needs on every rank
-        gsSparseMatrix<> csc;
-        A.matrix_into(csc);
-        gsSparseMatrix<real_t, RowMajor> csr = csc;
-        L.object("  global gsSparseMatrix (CSC)", memprobe::bytesOf(csc));
-        L.object("  global gsSparseMatrix (CSR)", memprobe::bytesOf(csr));
-        L.object("  petsc_copySparseMat maps (2 x N)", 2 * static_cast<long long>(N) * sizeof(index_t));
-        L.stage("legacy conversion (CSC + CSR)");
-        csc.resize(0,0); csc.data().squeeze();
-        csr.resize(0,0); csr.data().squeeze();
-        L.stage("legacy conversion freed");
+        gsPetscPatternSink pattern(comm, N, nLocal, permPtr);
+        A.computePattern_into(pattern, igrad(u, G) * igrad(u, G).tr());
+        L.stage("computePattern_into (MATPREALLOCATOR)");
+        PetscCall( pattern.createMatrix(PA) );
+        PetscCall( MatCreateVecs(PA, &Px, &Pb) );
+        PetscCall( VecSet(Pb, 0.0) );
+        L.stage("PETSc Mat/Vec (preallocated)");
+
+        gsPetscSystemSink system(PA, Pb, permPtr);
+        A.assemble_into(system, igrad(u, G) * igrad(u, G).tr() * meas(G), u * ff * meas(G));
+        nOff = system.offRankEntries();
+        L.stage("assemble_into (MatSetValues, stash)");
+        PetscCall( system.assembly() );
+        L.stage("PETSc assembly (communication)");
+        MatInfo info;
+        PetscCall( MatGetInfo(PA, MAT_LOCAL, &info) );
+        localNnz = static_cast<long long>(info.nz_used);
+        tAssemble = clock.stop();
+    }
+    else
+    {
+        A.initSystem();
+        L.stage("initSystem (fiber matrix + rhs)");
+        L.object("  gsFiberMatrix after initSystem", memprobe::bytesOf(A.fiberMatrix()));
+        L.object("  rhs vector", memprobe::bytesOf(A.rhs()));
+
+        A.computePattern(igrad(u, G) * igrad(u, G).tr());
+        L.stage("computePattern (local elements)");
+
+        A.assemble(igrad(u, G) * igrad(u, G).tr() * meas(G), u * ff * meas(G));
+        L.stage("assemble (local elements)");
+        L.object("  gsFiberMatrix after assembly", memprobe::bytesOf(A.fiberMatrix()));
+        localNnz = A.fiberMatrix().nonZeros();
+        tAssemble = clock.stop();
+
+        PetscCall( petsc_matFromLocalFibers(A.fiberMatrix(), comm, PA, &nOff, permPtr, nLocal) );
+        PetscCall( petsc_vecFromLocalContributions(A.rhs(), PA, Pb, permPtr) );
+        PetscCall( MatCreateVecs(PA, &Px, nullptr) );
+        L.stage("PETSc Mat/Vec (COO, distributed)");
+
+        if (legacy)
+        {
+            // What PETScSupport.h::petsc_copySparseMat needs on every rank
+            gsSparseMatrix<> csc;
+            A.matrix_into(csc);
+            gsSparseMatrix<real_t, RowMajor> csr = csc;
+            L.object("  global gsSparseMatrix (CSC)", memprobe::bytesOf(csc));
+            L.object("  global gsSparseMatrix (CSR)", memprobe::bytesOf(csr));
+            L.object("  petsc_copySparseMat maps (2 x N)", 2 * static_cast<long long>(N) * sizeof(index_t));
+            L.stage("legacy conversion (CSC + CSR)");
+            csc.resize(0,0); csc.data().squeeze();
+            csr.resize(0,0); csr.data().squeeze();
+            L.stage("legacy conversion freed");
+        }
+
+        // The assembler's storage is no longer needed once PETSc owns the system
+        A.giveFiberMatrix();
+        gsMatrix<> rhsMoved; A.rhs_into(rhsMoved); rhsMoved.resize(0,0);
+        L.stage("release assembler matrix/rhs");
     }
 
-    // The assembler's storage is no longer needed once PETSc owns the system
-    A.giveFiberMatrix();
-    gsMatrix<> rhsMoved; A.rhs_into(rhsMoved); rhsMoved.resize(0,0);
-    L.stage("release assembler matrix/rhs");
-
-    PetscCall( MatCreateVecs(PA, &Px, nullptr) );
+    clock.restart();
     PetscCall( KSPCreate(comm, &ksp) );
     PetscCall( KSPSetOperators(ksp, PA, PA) );
     PetscCall( KSPSetFromOptions(ksp) );
@@ -189,7 +255,8 @@ int main(int argc, char *argv[])
             for (index_t i = 0; i != act.rows(); ++i)
             {
                 const index_t ii = u.mapper().index(act(i), p);
-                if (u.mapper().is_free_index(ii)) needed.push_back(ii);
+                if (u.mapper().is_free_index(ii))
+                    needed.push_back(permPtr ? perm[ii] : ii);
             }
         }
         std::sort(needed.begin(), needed.end());
@@ -203,6 +270,12 @@ int main(int argc, char *argv[])
 
     gsMatrix<> solVector;
     PetscCall( petsc_gatherAll(Px, solVector) );
+    if (permPtr)
+    {
+        gsMatrix<> tmp(N, 1);
+        for (index_t g = 0; g != N; ++g) tmp(g) = solVector(perm[g]);
+        solVector.swap(tmp);
+    }
     L.stage("gather full solution (gsFeSolution)");
     L.object("  global solution vector", memprobe::bytesOf(solVector));
 
@@ -225,28 +298,33 @@ int main(int argc, char *argv[])
     MPI_Allreduce(MPI_IN_PLACE, &nnzSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
     MPI_Allreduce(MPI_IN_PLACE, &ghostMax, 1, MPI_LONG_LONG, MPI_MAX, comm);
 
+    std::string variant = partition;
+    if (noReserve) variant += "+noreserve";
+    if (lazy)      variant += "+lazy";
+    if (sink)      variant += "+sink";
+
     if (0 == rank)
     {
         gsInfo << "ranks " << nproc << ", dim " << dim << ", degree " << degree
                << ", patches " << mp.nPatches() << ", elements " << numElemGlobal
-               << ", dofs " << N << (refineGeometry ? " (refined geometry)" : "") << "\n"
+               << ", dofs " << N << (refineGeometry ? " (refined geometry)" : "")
+               << ", variant " << variant << "\n"
                << "KSP iterations " << its << ", L2 error " << l2 << "\n"
-               << "assembled entries (sum over ranks) " << nnzSum
-               << ", of which in rows owned by another rank " << offSum << "\n"
+               << (sink ? "matrix nonzeros (sum over ranks) " : "assembled entries (sum over ranks) ") << nnzSum
+               << ", " << (sink ? "element-block entries" : "entries") << " in rows owned by another rank " << offSum << "\n"
                << "max local+ghost dofs per rank " << ghostMax << " (" << 100.*ghostMax/N << "% of N)\n"
-               << "time: assemble " << tAssemble << "s, petsc+solve " << tSolve
+               << "time: assemble " << tAssemble << "s, solve " << tSolve
                << "s, post " << tPost << "s\n";
     }
     std::ostringstream tag;
     tag << "P=" << nproc << " d=" << dim << " p=" << degree << " N=" << N
-        << " patches=" << mp.nPatches() << (refineGeometry ? " geo" : "")
-        << (noReserve ? " noreserve" : "");
+        << " patches=" << mp.nPatches() << (refineGeometry ? " geo" : "") << " " << variant;
     L.report(gsInfo, tag.str());
     if (csv)
     {
         std::ostringstream ctag;
         ctag << "CSV," << nproc << "," << dim << "," << degree << "," << N << ","
-             << mp.nPatches() << "," << refineGeometry << "," << noReserve;
+             << mp.nPatches() << "," << refineGeometry << "," << noReserve << ",v=" << variant;
         L.csv(gsInfo, ctag.str());
     }
 

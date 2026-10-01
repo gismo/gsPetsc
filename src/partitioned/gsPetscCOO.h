@@ -23,21 +23,25 @@
 namespace gismo
 {
 
-/// @brief Creates the distributed matrix \a A (global size \a nRows x
-/// \a nCols, PETSc default row layout) from the rank-local
+/// @brief Creates the distributed square matrix \a A from the rank-local
 /// contributions stored in \a fm.
 /// @param[out] nOffRank number of local entries in rows owned by other ranks
+/// @param perm     optional global permutation of rows/columns
+///                 (e.g. gsPartitionedDofMapper::permutation())
+/// @param nLocal   rows owned by this rank (PETSC_DECIDE: equal split)
 template<class T, int Major>
 PetscErrorCode petsc_matFromLocalFibers(const gsFiberMatrix<T,Major> & fm,
                                         MPI_Comm comm, Mat & A,
-                                        PetscCount * nOffRank = nullptr)
+                                        PetscCount * nOffRank = nullptr,
+                                        const gsVector<index_t> * perm = nullptr,
+                                        PetscInt nLocal = PETSC_DECIDE)
 {
     PetscFunctionBeginUser;
     typedef typename gsFiberMatrix<T,Major>::Fiber Fiber;
     const bool rowMajor = (Major == RowMajor);
 
     PetscCall( MatCreate(comm, &A) );
-    PetscCall( MatSetSizes(A, PETSC_DECIDE, PETSC_DECIDE, fm.rows(), fm.cols()) );
+    PetscCall( MatSetSizes(A, nLocal, nLocal, fm.rows(), fm.cols()) );
     PetscCall( MatSetType(A, MATAIJ) );
     PetscCall( MatSetFromOptions(A) );
     PetscCall( MatSetUp(A) );
@@ -46,13 +50,17 @@ PetscErrorCode petsc_matFromLocalFibers(const gsFiberMatrix<T,Major> & fm,
     std::vector<PetscInt> ci, cj;
     std::vector<PetscScalar> cv;
     ci.reserve(nnz); cj.reserve(nnz); cv.reserve(nnz);
+    const auto P = [perm](index_t i) { return static_cast<PetscInt>(perm ? (*perm)[i] : i); };
     for (index_t f = 0; f != fm.fibers(); ++f)
+    {
+        if (!fm.isAllocated(f)) continue;
         for (typename Fiber::InnerIterator it(fm.fiber(f)); it; ++it)
         {
-            ci.push_back(rowMajor ? f : it.index());
-            cj.push_back(rowMajor ? it.index() : f);
+            ci.push_back(P(rowMajor ? f : it.index()));
+            cj.push_back(P(rowMajor ? it.index() : f));
             cv.push_back(it.value());
         }
+    }
 
     if (nOffRank)
     {
@@ -69,17 +77,18 @@ PetscErrorCode petsc_matFromLocalFibers(const gsFiberMatrix<T,Major> & fm,
 
 /// @brief Creates a distributed vector compatible with the rows of \a A and
 /// adds the rank-local contributions \a localRhs (global indexing,
-/// only nonzero entries are communicated).
+/// optionally permuted, only nonzero entries are communicated).
 template<class Derived>
 PetscErrorCode petsc_vecFromLocalContributions(const gsEigen::MatrixBase<Derived> & localRhs,
-                                               Mat A, Vec & b)
+                                               Mat A, Vec & b,
+                                               const gsVector<index_t> * perm = nullptr)
 {
     PetscFunctionBeginUser;
     PetscCall( MatCreateVecs(A, nullptr, &b) );
     PetscCall( VecSet(b, 0.0) );
     for (index_t i = 0; i != localRhs.rows(); ++i)
         if (0 != localRhs(i, 0))
-            PetscCall( VecSetValue(b, i, localRhs(i, 0), ADD_VALUES) );
+            PetscCall( VecSetValue(b, perm ? (*perm)[i] : i, localRhs(i, 0), ADD_VALUES) );
     PetscCall( VecAssemblyBegin(b) );
     PetscCall( VecAssemblyEnd(b) );
     PetscFunctionReturn(PETSC_SUCCESS);

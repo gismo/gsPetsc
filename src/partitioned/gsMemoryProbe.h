@@ -78,9 +78,13 @@ template<class T, int Major>
 inline long long bytesOf(const gsFiberMatrix<T,Major> & m)
 {
     // one heap-allocated sparse vector object per fiber + its reserved storage
-    long long b = m.fibers() * (sizeof(void*) + sizeof(typename gsFiberMatrix<T,Major>::Fiber));
+    // one pointer per fiber, plus a heap-allocated sparse vector and its
+    // storage for every allocated fiber
+    long long b = m.fibers() * sizeof(void*);
     for (index_t i = 0; i != m.fibers(); ++i)
-        b += m.fiber(i).data().allocatedSize() * (sizeof(T) + sizeof(typename gsFiberMatrix<T,Major>::Fiber::StorageIndex));
+        if (m.isAllocated(i))
+            b += sizeof(typename gsFiberMatrix<T,Major>::Fiber) +
+                 m.fiber(i).data().allocatedSize() * (sizeof(T) + sizeof(typename gsFiberMatrix<T,Major>::Fiber::StorageIndex));
     return b;
 }
 
