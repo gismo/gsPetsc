@@ -34,8 +34,9 @@
       --rendezvous  (with --local) dof ownership and rows by a distributed
                rendezvous: lowest touching rank owns a dof, no global
                tables (gsPartitionedDofMapper is not built)
-      --sink   assemble directly into PETSc (computePattern_into with a
-               MATPREALLOCATOR, assemble_into with MatSetValues); no
+      --sink   assemble directly into PETSc (computePattern_into with
+               gsPetscPatternSink: exact AIJ preallocation, assemble_into
+               with MatSetValues); no
                gismo-side matrix or rhs
 
     Example run:
@@ -201,13 +202,18 @@ int main(int argc, char *argv[])
     Mat PA; Vec Pb, Px; KSP ksp;
     PetscCount nOff = 0;
     long long localNnz = 0;
+    long long localSlots = 0, localMallocs = 0;
     double tAssemble = 0;
     if (sink)
     {
         gsPetscPatternSink pattern(comm, N, nLocal, permPtr);
         A.computePattern_into(pattern, igrad(u, G) * igrad(u, G).tr());
-        L.stage("computePattern_into (MATPREALLOCATOR)");
+        L.stage("computePattern_into (pattern sink)");
+        L.object("  pattern sink stored blocks", static_cast<long long>(pattern.storedBytes()));
         PetscCall( pattern.createMatrix(PA) );
+        MatInfo pinfo;
+        PetscCall( MatGetInfo(PA, MAT_LOCAL, &pinfo) );
+        localSlots = static_cast<long long>(pinfo.nz_allocated);
         PetscCall( MatCreateVecs(PA, &Px, &Pb) );
         PetscCall( VecSet(Pb, 0.0) );
         L.stage("PETSc Mat/Vec (preallocated)");
@@ -221,6 +227,7 @@ int main(int argc, char *argv[])
         MatInfo info;
         PetscCall( MatGetInfo(PA, MAT_LOCAL, &info) );
         localNnz = static_cast<long long>(info.nz_used);
+        localMallocs = static_cast<long long>(info.mallocs);
         tAssemble = clock.stop();
     }
     else
@@ -343,6 +350,9 @@ int main(int argc, char *argv[])
     long long offSum = nOff, nnzSum = localNnz, ghostMax = needed.size();
     MPI_Allreduce(MPI_IN_PLACE, &offSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
     MPI_Allreduce(MPI_IN_PLACE, &nnzSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
+    long long slotSum = localSlots, mallocMax = localMallocs;
+    MPI_Allreduce(MPI_IN_PLACE, &slotSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &mallocMax, 1, MPI_LONG_LONG, MPI_MAX, comm);
     MPI_Allreduce(MPI_IN_PLACE, &ghostMax, 1, MPI_LONG_LONG, MPI_MAX, comm);
 
     std::string variant = partition;
@@ -364,6 +374,9 @@ int main(int argc, char *argv[])
                << "max local+ghost dofs per rank " << ghostMax << " (" << 100.*ghostMax/N << "% of N)\n"
                << "time: assemble " << tAssemble << "s, solve " << tSolve
                << "s, post " << tPost << "s\n";
+        if (sink)
+            gsInfo << "preallocated slots (sum over ranks) " << slotSum
+                   << ", mallocs (max over ranks) " << mallocMax << "\n";
     }
     std::ostringstream tag;
     tag << "P=" << nproc << " d=" << dim << " p=" << degree << " N=" << N

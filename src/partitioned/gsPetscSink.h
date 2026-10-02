@@ -26,6 +26,9 @@
 
 #include <petscmat.h>
 #include <algorithm>
+#include <climits>
+#include <utility>
+#include <vector>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -44,66 +47,253 @@ inline void mapIndices(const gsVector<index_t> & idx, const gsVector<index_t> * 
 }
 }
 
-/// @brief Collects the sparsity pattern in a MATPREALLOCATOR matrix and
-/// preallocates the target matrix with it.
+/// @brief Collects the sparsity pattern of the assembled blocks and
+/// preallocates an AIJ matrix exactly with it.
+///
+/// The index blocks of all addPattern() calls are stored (E calls with
+/// blocks of size k use O(E k) indices). createMatrix() counts the
+/// distinct columns of every owned row, split into the diagonal block
+/// (columns owned by this rank) and the off-diagonal block, and sends the
+/// (row, column) pairs of rows owned by other ranks to their owners. The
+/// matrix is then preallocated with MatXAIJSetPreallocation(), so the
+/// number of allocated slots equals the number of nonzeros and no
+/// reallocation (malloc) occurs during assembly. The layout is square and
+/// is the PETSc default layout (PetscSplitOwnership) for \a nLocal.
 class gsPetscPatternSink
 {
 public:
+    /// @param comm communicator of the matrix
+    /// @param N global number of rows (=cols)
     /// @param nLocal number of rows (=cols) owned by this rank, or PETSC_DECIDE
+    /// @param perm optional map from assembler dof index to PETSc row
     gsPetscPatternSink(MPI_Comm comm, PetscInt N, PetscInt nLocal = PETSC_DECIDE,
                        const gsVector<index_t> * perm = nullptr)
-    : m_perm(perm)
+    : m_comm(comm), m_N(N), m_nLocal(nLocal), m_perm(perm), m_created(false)
     {
-        PetscCallAbort(comm, MatCreate(comm, &m_pre));
-        PetscCallAbort(comm, MatSetSizes(m_pre, nLocal, nLocal, N, N));
-        PetscCallAbort(comm, MatSetType(m_pre, MATPREALLOCATOR));
-        PetscCallAbort(comm, MatSetUp(m_pre));
+        m_rowOff.push_back(0);
+        m_colOff.push_back(0);
     }
 
-    ~gsPetscPatternSink() { MatDestroy(&m_pre); }
-
+    /// Stores the index blocks of one element (thread-safe). Negative
+    /// indices (non-free dofs) are dropped.
     void addPattern(const gsVector<index_t> & rows, const gsVector<index_t> & cols)
     {
 #       pragma omp critical (gsPetscSink)
         {
-            // MATPREALLOCATOR does not accept negative (ignored) indices
             petsc_sink_detail::mapIndices(rows, m_perm, m_r);
             petsc_sink_detail::mapIndices(cols, m_perm, m_c);
             m_r.erase(std::remove(m_r.begin(), m_r.end(), -1), m_r.end());
             m_c.erase(std::remove(m_c.begin(), m_c.end(), -1), m_c.end());
-            m_zeros.assign(m_r.size() * m_c.size(), 0.0);
-            PetscCallAbort(PETSC_COMM_SELF,
-                MatSetValues(m_pre, m_r.size(), m_r.data(), m_c.size(), m_c.data(),
-                             m_zeros.data(), INSERT_VALUES));
+            if (!m_r.empty() && !m_c.empty())
+            {
+                m_rowIdx.insert(m_rowIdx.end(), m_r.begin(), m_r.end());
+                m_colIdx.insert(m_colIdx.end(), m_c.begin(), m_c.end());
+                m_rowOff.push_back(m_rowIdx.size());
+                m_colOff.push_back(m_colIdx.size());
+            }
         }
     }
 
+    /// Bytes reserved by the stored index blocks (indices and offsets).
+    /// They are released by createMatrix().
+    std::size_t storedBytes() const
+    {
+        return (m_rowIdx.capacity() + m_colIdx.capacity()) * sizeof(PetscInt)
+             + (m_rowOff.capacity() + m_colOff.capacity()) * sizeof(std::size_t);
+    }
+
     /// Creates the AIJ matrix \a A with the same layout, preallocated
-    /// exactly with the collected pattern
+    /// exactly with the collected pattern. Collective; the sink can be
+    /// used once.
+    ///
+    /// Time O(E k^2 log k) plus O(number of received pairs); memory
+    /// O(E k) indices, released before the matrix is allocated.
     PetscErrorCode createMatrix(Mat & A)
     {
         PetscFunctionBeginUser;
-        MPI_Comm comm;
-        PetscInt m, n, M, N;
-        PetscCall( PetscObjectGetComm((PetscObject)m_pre, &comm) );
-        PetscCall( MatAssemblyBegin(m_pre, MAT_FINAL_ASSEMBLY) );
-        PetscCall( MatAssemblyEnd  (m_pre, MAT_FINAL_ASSEMBLY) );
-        PetscCall( MatGetLocalSize(m_pre, &m, &n) );
-        PetscCall( MatGetSize(m_pre, &M, &N) );
-        PetscCall( MatCreate(comm, &A) );
-        PetscCall( MatSetSizes(A, m, n, M, N) );
+        GISMO_ENSURE(!m_created, "gsPetscPatternSink::createMatrix: the sink is single-use");
+        m_created = true;
+
+        // Ownership: contiguous ranges [rs,re), the layout of MatSetSizes
+        PetscInt n = m_nLocal, Nglob = m_N;
+        PetscCall( PetscSplitOwnership(m_comm, &n, &Nglob) );
+        PetscMPIInt size;
+        PetscCallMPI( MPI_Comm_size(m_comm, &size) );
+        PetscInt re = 0;
+        PetscCallMPI( MPI_Scan(&n, &re, 1, MPIU_INT, MPI_SUM, m_comm) );
+        const PetscInt rs = re - n;
+        std::vector<PetscInt> ends(size);
+        PetscCallMPI( MPI_Allgather(&re, 1, MPIU_INT, ends.data(), 1, MPIU_INT, m_comm) );
+
+        const std::size_t numCalls = m_rowOff.size() - 1;
+        GISMO_ENSURE(numCalls < static_cast<std::size_t>(INT_MAX),
+                     "gsPetscPatternSink: too many stored blocks");
+
+        // Owned rows: calls touching each row (counting sort)
+        std::vector<std::size_t> rowPtr;
+        rowPtr.reserve(n + 1);
+        rowPtr.assign(n + 1, 0);
+        for (std::size_t k = 0; k != m_rowIdx.size(); ++k)
+            if (m_rowIdx[k] >= rs && m_rowIdx[k] < re)
+                ++rowPtr[m_rowIdx[k] - rs + 1];
+        for (PetscInt i = 0; i != n; ++i)
+            rowPtr[i + 1] += rowPtr[i];
+        std::vector<PetscInt> rowCalls;
+        rowCalls.reserve(rowPtr[n]);
+        rowCalls.resize(rowPtr[n]);
+        {
+            std::vector<std::size_t> cur(rowPtr.begin(), rowPtr.end() - 1);
+            for (std::size_t j = 0; j != numCalls; ++j)
+                for (std::size_t k = m_rowOff[j]; k != m_rowOff[j + 1]; ++k)
+                    if (m_rowIdx[k] >= rs && m_rowIdx[k] < re)
+                        rowCalls[cur[m_rowIdx[k] - rs]++] = static_cast<PetscInt>(j);
+        }
+
+        // Rows owned by other ranks: unique (row, col) pairs, sorted by
+        // row and therefore grouped by owner (owner ranges are increasing)
+        typedef std::pair<PetscInt,PetscInt> Pair;
+        std::vector<Pair> pairs;
+        {
+            std::size_t cnt = 0;
+            for (std::size_t j = 0; j != numCalls; ++j)
+                for (std::size_t k = m_rowOff[j]; k != m_rowOff[j + 1]; ++k)
+                    if (m_rowIdx[k] < rs || m_rowIdx[k] >= re)
+                        cnt += m_colOff[j + 1] - m_colOff[j];
+            pairs.reserve(cnt);
+            for (std::size_t j = 0; j != numCalls; ++j)
+                for (std::size_t k = m_rowOff[j]; k != m_rowOff[j + 1]; ++k)
+                    if (m_rowIdx[k] < rs || m_rowIdx[k] >= re)
+                        for (std::size_t l = m_colOff[j]; l != m_colOff[j + 1]; ++l)
+                            pairs.push_back(Pair(m_rowIdx[k], m_colIdx[l]));
+        }
+        std::sort(pairs.begin(), pairs.end());
+        pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+
+        std::vector<int> sendCnt(size, 0), sendDsp(size, 0), recvCnt(size), recvDsp(size, 0);
+        std::vector<PetscInt> sendBuf;
+        sendBuf.reserve(2 * pairs.size());
+        {
+            std::size_t tot = 0;
+            for (std::size_t q = 0; q != pairs.size(); ++q)
+            {
+                const PetscMPIInt dest = static_cast<PetscMPIInt>(
+                    std::upper_bound(ends.begin(), ends.end(), pairs[q].first) - ends.begin());
+                sendCnt[dest] += 2;
+                sendBuf.push_back(pairs[q].first);
+                sendBuf.push_back(pairs[q].second);
+            }
+            for (PetscMPIInt p = 0; p != size; ++p)
+            {
+                sendDsp[p] = static_cast<int>(tot);
+                tot += sendCnt[p];
+                GISMO_ENSURE(tot <= static_cast<std::size_t>(INT_MAX),
+                             "gsPetscPatternSink: pair exchange exceeds the MPI count range");
+            }
+        }
+        std::vector<Pair>().swap(pairs);
+
+        PetscCallMPI( MPI_Alltoall(sendCnt.data(), 1, MPI_INT, recvCnt.data(), 1, MPI_INT, m_comm) );
+        {
+            std::size_t tot = 0;
+            for (PetscMPIInt p = 0; p != size; ++p)
+            {
+                recvDsp[p] = static_cast<int>(tot);
+                tot += recvCnt[p];
+                GISMO_ENSURE(tot <= static_cast<std::size_t>(INT_MAX),
+                             "gsPetscPatternSink: pair exchange exceeds the MPI count range");
+            }
+        }
+        std::size_t totRecv = static_cast<std::size_t>(recvDsp[size - 1]) + recvCnt[size - 1];
+        std::vector<PetscInt> recvBuf(totRecv);
+        PetscCallMPI( MPI_Alltoallv(sendBuf.data(), sendCnt.data(), sendDsp.data(), MPIU_INT,
+                                    recvBuf.data(), recvCnt.data(), recvDsp.data(), MPIU_INT, m_comm) );
+        std::vector<PetscInt>().swap(sendBuf);
+
+        // Received pairs by owned row (counting sort)
+        std::vector<std::size_t> recvPtr;
+        recvPtr.reserve(n + 1);
+        recvPtr.assign(n + 1, 0);
+        for (std::size_t q = 0; q != totRecv; q += 2)
+        {
+            GISMO_ENSURE(recvBuf[q] >= rs && recvBuf[q] < re,
+                         "gsPetscPatternSink: received a row that is not owned");
+            ++recvPtr[recvBuf[q] - rs + 1];
+        }
+        for (PetscInt i = 0; i != n; ++i)
+            recvPtr[i + 1] += recvPtr[i];
+        std::vector<PetscInt> recvCols;
+        recvCols.reserve(totRecv / 2);
+        recvCols.resize(totRecv / 2);
+        {
+            std::vector<std::size_t> cur(recvPtr.begin(), recvPtr.end() - 1);
+            for (std::size_t q = 0; q != totRecv; q += 2)
+                recvCols[cur[recvBuf[q] - rs]++] = recvBuf[q + 1];
+        }
+        std::vector<PetscInt>().swap(recvBuf);
+
+        // Distinct columns of every owned row: diagonal / off-diagonal counts
+        std::vector<PetscInt> d_nnz, o_nnz, scratch;
+        d_nnz.reserve(n);
+        o_nnz.reserve(n);
+        d_nnz.assign(n, 0);
+        o_nnz.assign(n, 0);
+        for (PetscInt i = 0; i != n; ++i)
+        {
+            scratch.clear();
+            for (std::size_t t = rowPtr[i]; t != rowPtr[i + 1]; ++t)
+            {
+                const std::size_t j = rowCalls[t];
+                scratch.insert(scratch.end(), m_colIdx.begin() + m_colOff[j],
+                                              m_colIdx.begin() + m_colOff[j + 1]);
+            }
+            scratch.insert(scratch.end(), recvCols.begin() + recvPtr[i],
+                                          recvCols.begin() + recvPtr[i + 1]);
+            std::sort(scratch.begin(), scratch.end());
+            scratch.erase(std::unique(scratch.begin(), scratch.end()), scratch.end());
+            for (std::size_t t = 0; t != scratch.size(); ++t)
+                (scratch[t] >= rs && scratch[t] < re ? d_nnz[i] : o_nnz[i])++;
+        }
+
+        // Release the stored blocks before the matrix is allocated
+        std::vector<PetscInt>().swap(m_rowIdx);
+        std::vector<PetscInt>().swap(m_colIdx);
+        std::vector<std::size_t>().swap(m_rowOff);
+        std::vector<std::size_t>().swap(m_colOff);
+        std::vector<PetscInt>().swap(m_r);
+        std::vector<PetscInt>().swap(m_c);
+        std::vector<std::size_t>().swap(rowPtr);
+        std::vector<PetscInt>().swap(rowCalls);
+        std::vector<std::size_t>().swap(recvPtr);
+        std::vector<PetscInt>().swap(recvCols);
+        std::vector<PetscInt>().swap(scratch);
+
+        PetscCall( MatCreate(m_comm, &A) );
+        PetscCall( MatSetSizes(A, n, n, m_N, m_N) );
         PetscCall( MatSetType(A, MATAIJ) );
         PetscCall( MatSetFromOptions(A) );
-        PetscCall( MatPreallocatorPreallocate(m_pre, PETSC_TRUE, A) );
-        PetscCall( MatDestroy(&m_pre) );
+        PetscBool isAIJ;
+        PetscCall( PetscObjectTypeCompareAny((PetscObject)A, &isAIJ, MATSEQAIJ, MATMPIAIJ, "") );
+        GISMO_ENSURE(isAIJ, "gsPetscPatternSink: d/o counts are scalar AIJ counts; "
+                            "-mat_type other than aij is not supported");
+        PetscCall( MatXAIJSetPreallocation(A, 1, d_nnz.data(), o_nnz.data(), NULL, NULL) );
+        PetscCall( MatSetOption(A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE) );
+        PetscInt rs2, re2;
+        PetscCall( MatGetOwnershipRange(A, &rs2, &re2) );
+        GISMO_ENSURE(rs2 == rs && re2 == re, "gsPetscPatternSink: matrix layout differs from the sink layout");
         PetscFunctionReturn(PETSC_SUCCESS);
     }
 
 private:
-    Mat m_pre;
+    MPI_Comm m_comm;
+    PetscInt m_N, m_nLocal;
     const gsVector<index_t> * m_perm;
+    bool m_created;
+    // Stored blocks (CSR of calls): call j has rows m_rowIdx[m_rowOff[j]..m_rowOff[j+1])
+    // and cols m_colIdx[m_colOff[j]..m_colOff[j+1]); offsets are size_t as E k
+    // can exceed the 32-bit PetscInt range
+    std::vector<PetscInt> m_rowIdx, m_colIdx;
+    std::vector<std::size_t> m_rowOff, m_colOff;
     std::vector<PetscInt> m_r, m_c;
-    std::vector<PetscScalar> m_zeros;
 };
 
 /// @brief Adds element blocks to a PETSc matrix and right-hand side vector
