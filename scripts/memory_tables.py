@@ -15,7 +15,8 @@ for line in open(sys.argv[1]):
                          name=rest[0].strip(),kind=rest[1],mn=int(rest[2]),mx=int(rest[3]),sm=int(rest[4])))
 MB=1024*1024
 def table(filt, key, title, kind=None):
-    sel=[r for r in rows if filt(r) and ((r['kind']=='time') == (kind=='time'))]
+    # memory tables: heap deltas and object sizes only (not rss/peakrss/count)
+    sel=[r for r in rows if filt(r) and (r['kind']=='time' if kind=='time' else r['kind'] in ('stage','object'))]
     keys=sorted(set(key(r) for r in sel))
     names=[]
     for r in sel:

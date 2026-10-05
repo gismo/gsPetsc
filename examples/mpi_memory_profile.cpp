@@ -7,7 +7,12 @@
       1. builds the full multipatch geometry and multibasis (replicated),
       2. assembles only its own block of elements with gsExprAssembler
          (via gsElementRangeDomain),
-      3. sends its contributions to a distributed PETSc matrix (COO),
+      3. sends its contributions to a distributed PETSc matrix:
+         - without --sink: gismo fiber matrix -> PETSc COO;
+         - with --sink: computePattern_into into gsPetscPatternSink (exact
+           AIJ preallocation), then assemble_into into gsPetscSystemSink
+           (MatSetValues),
+         optionally after localizing the dof numbering (--local),
       4. solves with KSP,
       5. gathers the solution for gsFeSolution and computes the error on its
          own elements.
@@ -24,20 +29,76 @@
     License, v. 2.0. If a copy of the MPL was not distributed with this
     file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-    Variants:
-      --partition block|rcb|hilbert|morton  element partition; the geometric
-               ones use gsGeometricPartitioner and the dof ownership of
-               gsPartitionedDofMapper (PETSc rows aligned with the elements)
+    Options (defaults in brackets):
+      -d, --dim D     spatial dimension, 2 or 3 [2]
+      -p, --degree P  spline degree [2]
+      -r, --refine R  uniform h-refinement steps [5]
+      -s, --split S   patch grid of 2^S patches per direction [1]
+      -a, --aspect A  multiply the patches in the last direction by A
+               (weak scaling) [1]
+      --partition block|rcb|hilbert|morton  element partition [block]; the
+               geometric ones use gsGeometricPartitioner and the dof
+               ownership of gsPartitionedDofMapper (PETSc rows aligned with
+               the elements)
+      --geo    refine the geometry together with the basis
+      --legacy also measure the conversion path of PETScSupport.h (global
+               gsSparseMatrix + RowMajor copy); excludes --sink and --local
+      --noreserve  do not reserve fiber storage in initSystem
       --lazy   gsExprAssembler option lazyMatrix (fibers allocated on first use)
       --local  rank-local dof numbering (gsDofMapper::localize): local
                matrix, rhs and solution, no global vector on any rank
-      --rendezvous  (with --local) dof ownership and rows by a distributed
+      --rendezvous  (needs --local) dof ownership and rows by a distributed
                rendezvous: lowest touching rank owns a dof, no global
                tables (gsPartitionedDofMapper is not built)
-      --sink   assemble directly into PETSc (computePattern_into with
-               gsPetscPatternSink: exact AIJ preallocation, assemble_into
-               with MatSetValues); no
-               gismo-side matrix or rhs
+      --sink   assemble directly into PETSc (no gismo-side matrix or rhs):
+               computePattern_into with gsPetscPatternSink (exact AIJ
+               preallocation), assemble_into with gsPetscSystemSink
+               (MatSetValues)
+      --sparse-mapper  sparse gsDofMapper storage for the space
+               (gsFeSpace::setMapperStorage). The nBytes() of the mapper is
+               reported at three points: "setup" is a separate, unfinalized
+               mapper built by the same createMapper call after the ledger;
+               "finalized" and "localized" are the space's own mapper right
+               after u.setup and after localization
+      --check-mapper  (needs --sparse-mapper) compare the mapper query by
+               query with a dense twin built by the same calls, and again
+               after an extra localization; aborts on the first difference
+      --serial-partition  (needs a geometric --partition) every rank runs the
+               whole pass A of gsGeometricPartitioner (serial constructor);
+               by default pass A is split over the ranks (gsMpiComm
+               constructor). The variant gets the suffix "+serialpart"
+      --check-partition  (needs a geometric --partition) every rank also builds
+               a serial partitioner with the same options and compares labels.
+               The parallel labels must be identical on all ranks, otherwise
+               all ranks abort together. Differences from the serial labels
+               are printed on rank 0 and are not fatal
+      --csv    print CSV lines (prefix CSV,) in addition to the table
+      -o, --petsc OPTS  PETSc options
+               ["-ksp_type cg -pc_type gamg -ksp_rtol 1e-10"]
+
+    Ledger stages on the --sink path:
+    "localize mapper (local -> global rows)" (with --local),
+    "computePattern_into (pattern sink)",
+    "PETSc Mat/Vec (preallocated)", "assemble_into (MatSetValues, stash)" and
+    "PETSc assembly (communication)". With a geometric partition the
+    partition is three stages "element partition (<strategy>): construct
+    (element domain)", "...: partition() (centroids + labels)" and
+    "...: subdomainForRank"; the solve is "KSP setup (incl. preconditioner)"
+    and "KSP solve". With --check-partition an extra stage "partition check
+    (not part of the run)" follows the partition stages, and "peak RSS (whole
+    run)" includes its transient.
+
+    Every stage reports the heap it still holds at its end, VmRSS at its end
+    and VmHWM over the stage (transients included). The objects at the top
+    are the start-up baseline: VmRSS after MPI_Init, then VmRSS with its
+    RssAnon / RssFile / RssShmem parts after PetscInitialize. The counts at
+    the bottom (local elements, owned rows, local+ghost dofs, nonzeros and
+    off-rank entries per rank) measure load balance and partition quality.
+
+    PETSc's own profile: -log_view and -memory_view must be set before
+    PetscInitialize, i.e. through the environment, e.g.
+    PETSC_OPTIONS="-log_view :petsc_log.txt -memory_view"; options given
+    with -o are inserted after initialization.
 
     Example run:
     mpirun -np 4 ./bin/mpi_memory_profile -r 7 -p 2 -s 1 --partition rcb --sink
@@ -59,6 +120,8 @@ int main(int argc, char *argv[])
     index_t dim = 2, degree = 2, numRefine = 5, numSplit = 1, aspect = 1;
     bool refineGeometry = false, legacy = false, csv = false, noReserve = false;
     bool lazy = false, sink = false, localNumbering = false, rendezvous = false;
+    bool sparseMapper = false, checkMapper = false;
+    bool serialPartition = false, checkPartition = false;
     std::string partition("block");
     std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10");
 
@@ -76,20 +139,29 @@ int main(int argc, char *argv[])
     cmd.addSwitch("local", "Rank-local dof numbering (localized mapper)", localNumbering);
     cmd.addSwitch("rendezvous", "Distributed dof ownership/rows (needs --local)", rendezvous);
     cmd.addSwitch("sink", "Assemble directly into PETSc (no gismo matrix/rhs)", sink);
+    cmd.addSwitch("sparse-mapper", "Opt-in sparse gsDofMapper storage (gsFeSpace::setMapperStorage)", sparseMapper);
+    cmd.addSwitch("check-mapper", "With --sparse-mapper: after the run, compare the mapper with a dense twin built by the same calls (aborts on the first difference)", checkMapper);
+    cmd.addSwitch("serial-partition", "Geometric partition: every rank runs the whole pass A (serial gsGeometricPartitioner constructor) instead of splitting it over the ranks", serialPartition);
+    cmd.addSwitch("check-partition", "Geometric partition: also build a serial partitioner on every rank and compare the labels (fatal if they differ across ranks, reported if they differ from serial)", checkPartition);
     cmd.addSwitch("csv", "Print CSV lines (prefix CSV,) in addition to the table", csv);
     cmd.addString("o", "petsc", "PETSc options", petscOpts);
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
     GISMO_ENSURE(!(sink && legacy), "--legacy needs the gismo-side matrix, it cannot be combined with --sink");
     GISMO_ENSURE(!rendezvous || localNumbering, "--rendezvous needs --local");
+    GISMO_ENSURE(!checkMapper || sparseMapper, "--check-mapper needs --sparse-mapper");
+    GISMO_ENSURE(!checkPartition  || "block" != partition, "--check-partition needs a geometric partition (rcb, hilbert or morton)");
+    GISMO_ENSURE(!serialPartition || "block" != partition, "--serial-partition needs a geometric partition (rcb, hilbert or morton)");
     GISMO_ENSURE(!(localNumbering && legacy), "--legacy needs the global numbering, it cannot be combined with --local");
 
     const gsMpi & mpi = gsMpi::init(argc, argv);
     gsMpiComm comm = mpi.worldComm();
     const int rank = comm.rank(), nproc = comm.size();
+    const long long rssAfterMpi = memprobe::rssBytes();
     PetscCall( PetscInitializeNoArguments() );
     PetscCall( PetscOptionsInsertString(NULL, petscOpts.c_str()) );
 
     memprobe::Ledger L(comm);
+    L.object("RSS after MPI init (before PETSc)", rssAfterMpi);
     gsStopwatch clock;
 
     // ------------------------------------------------------------------
@@ -139,11 +211,13 @@ int main(int argc, char *argv[])
     auto ff = A.getCoeff(f, G);
     auto u_ex = ev.getVariable(ms, G);
 
+    if (sparseMapper) u.setMapperStorage(gsDofMapper::storage::sparse);
     u.setup(bc, dirichlet::interpolation, 0);
     const index_t N = u.mapper().freeSize();
     L.stage("space setup (gsDofMapper + Dirichlet)");
     L.object("  gsDofMapper", memprobe::bytesOf(u.mapper()));
     L.object("  fixed (Dirichlet) dofs", memprobe::bytesOf(u.fixedPart()));
+    const long long mapperBytesFinal = static_cast<long long>(u.mapper().nBytes());
 
     const index_t numElemGlobal = mb.domain()->numElements();
     gsDomain<>::Ptr myDomain;
@@ -158,10 +232,66 @@ int main(int argc, char *argv[])
     {
         gsGeometricPartitioner<real_t>::Options popt;
         popt.strategy = gsGeometricPartitioner<real_t>::strategyFromString(partition);
-        gsGeometricPartitioner<real_t> part(mp, mb, u.mapper(), nproc, popt);
+        // Pass A is split over the ranks unless --serial-partition. The three
+        // sub-stages share the prefix "element partition (<strategy>)"; their
+        // sum is the partition cost.
+        const std::string pre = "element partition (" + partition + "): ";
+        std::unique_ptr<gsGeometricPartitioner<real_t> > partPtr(serialPartition
+            ? new gsGeometricPartitioner<real_t>(mp, mb, u.mapper(), nproc, popt)
+            : new gsGeometricPartitioner<real_t>(mp, mb, u.mapper(), nproc, comm, popt));
+        gsGeometricPartitioner<real_t> & part = *partPtr;
+        L.stage(pre + "construct (element domain)");
         part.partition();
+        L.stage(pre + "partition() (centroids + labels)");
         myDomain = part.subdomainForRank(rank, nproc);
-        L.stage("element partition (" + partition + ", incl. labels)");
+        L.stage(pre + "subdomainForRank");
+        if (checkPartition)
+        {
+            // Cost: one extra serial partition (pass A O(N) plus labelling,
+            // RCB O(N log P), curves O(N log N)) and O(N) hashing/comparison
+            // for N elements. Run in its own stage so that none of it is
+            // charged to the partition stages.
+            long long diff = 0;
+            const long long nElem = static_cast<long long>(part.labels().size());
+            {
+                gsGeometricPartitioner<real_t> ser(mp, mb, u.mapper(), nproc, popt);
+                ser.partition();
+
+                // FNV-1a over the labels in element order (order-sensitive)
+                std::uint64_t h = 14695981039346656037ull;
+                for (index_t l : part.labels())
+                {
+                    h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(l));
+                    h *= 1099511628211ull;
+                }
+                // The verdict is evaluated on every rank after the reductions,
+                // so all ranks throw together or none does.
+                const bool sizeMismatch = (ser.labels().size() != part.labels().size());
+                std::uint64_t mn[3] = { h, static_cast<std::uint64_t>(part.labels().size()),
+                                        static_cast<std::uint64_t>(sizeMismatch) };
+                std::uint64_t mx[3] = { mn[0], mn[1], mn[2] };
+                MPI_Allreduce(MPI_IN_PLACE, mn, 3, MPI_UINT64_T, MPI_MIN, comm);
+                MPI_Allreduce(MPI_IN_PLACE, mx, 3, MPI_UINT64_T, MPI_MAX, comm);
+                GISMO_ENSURE(mn[0] == mx[0] && mn[1] == mx[1],
+                             "partition check: the parallel labels differ across ranks (hash/count min != max)");
+                GISMO_ENSURE(0 == mx[2],
+                             "partition check: the serial and parallel partitions have different element counts");
+
+                for (std::size_t e = 0; e < part.labels().size(); ++e)
+                    if (part.labels()[e] != ser.labels()[e])
+                        ++diff;
+                MPI_Allreduce(MPI_IN_PLACE, &diff, 1, MPI_LONG_LONG, MPI_MAX, comm);
+            }
+            if (0 == rank)
+            {
+                if (0 == diff)
+                    gsInfo << "partition check: labels identical across ranks; parallel vs serial: identical\n";
+                else
+                    gsInfo << "partition check: labels identical across ranks; parallel vs serial: "
+                           << diff << " of " << nElem << " elements differ\n";
+            }
+            L.stage("partition check (not part of the run)");
+        }
         if (!rendezvous)
         {
             gsPartitionedDofMapper pdm = part.makeDofMapper(nproc);
@@ -194,6 +324,7 @@ int main(int argc, char *argv[])
         L.stage("localize mapper (local -> global rows)");
         L.object("  local-to-global row map", rowOf.size() * sizeof(index_t));
     }
+    const long long mapperBytesLocal = static_cast<long long>(u.mapper().nBytes());
     A.setIntegrationDomain(myDomain);
 
     // ------------------------------------------------------------------
@@ -276,10 +407,12 @@ int main(int argc, char *argv[])
     PetscCall( KSPCreate(comm, &ksp) );
     PetscCall( KSPSetOperators(ksp, PA, PA) );
     PetscCall( KSPSetFromOptions(ksp) );
+    PetscCall( KSPSetUp(ksp) );
+    L.stage("KSP setup (incl. preconditioner)");
     PetscCall( KSPSolve(ksp, Pb, Px) );
     PetscInt its;
     PetscCall( KSPGetIterationNumber(ksp, &its) );
-    L.stage("KSP setup + solve");
+    L.stage("KSP solve");
     const double tSolve = clock.stop();
 
     // ------------------------------------------------------------------
@@ -347,6 +480,15 @@ int main(int argc, char *argv[])
     L.stage("error evaluation (local elements)");
     const double tPost = clock.stop();
 
+    // Per-rank load and partition quality; max/sum = 1/P for a perfect balance.
+    PetscInt rowLo, rowHi;
+    PetscCall( MatGetOwnershipRange(PA, &rowLo, &rowHi) );
+    L.count("local elements", static_cast<long long>(myDomain->numElements()));
+    L.count("owned PETSc rows", static_cast<long long>(rowHi - rowLo));
+    L.count("local+ghost dofs", static_cast<long long>(needed.size()));
+    L.count("matrix nonzeros in owned rows", localNnz);
+    L.count("entries in rows of another rank", static_cast<long long>(nOff));
+
     long long offSum = nOff, nnzSum = localNnz, ghostMax = needed.size();
     MPI_Allreduce(MPI_IN_PLACE, &offSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
     MPI_Allreduce(MPI_IN_PLACE, &nnzSum, 1, MPI_LONG_LONG, MPI_SUM, comm);
@@ -356,11 +498,13 @@ int main(int argc, char *argv[])
     MPI_Allreduce(MPI_IN_PLACE, &ghostMax, 1, MPI_LONG_LONG, MPI_MAX, comm);
 
     std::string variant = partition;
+    if (serialPartition) variant += "+serialpart";
     if (noReserve) variant += "+noreserve";
     if (lazy)      variant += "+lazy";
     if (localNumbering) variant += "+local";
     if (rendezvous)     variant += "+rv";
     if (sink)      variant += "+sink";
+    if (sparseMapper) variant += "+sparsemap";
 
     if (0 == rank)
     {
@@ -388,6 +532,91 @@ int main(int argc, char *argv[])
         ctag << "CSV," << nproc << "," << dim << "," << degree << "," << N << ","
              << mp.nPatches() << "," << refineGeometry << "," << noReserve << ",v=" << variant;
         L.csv(gsInfo, ctag.str());
+    }
+
+    // Mapper memory report and dense-twin check; no ledger stage follows.
+    const gsDofMapper::storage mapperSt = u.mapperStorage();
+    {
+        const gsDofMapper probe = createMapper(mb, bc, 1, u.id(), /*conforming=*/true,
+                                               /*finalize=*/false, mapperSt);
+        long long bytes[3] = { static_cast<long long>(probe.nBytes()),
+                               mapperBytesFinal, mapperBytesLocal };
+        MPI_Allreduce(MPI_IN_PLACE, bytes, 3, MPI_LONG_LONG, MPI_MAX, comm);
+        if (0 == rank)
+        {
+            gsInfo << "gsDofMapper nBytes (max over ranks, storage "
+                   << (gsDofMapper::storage::sparse == mapperSt ? "sparse" : "dense")
+                   << "): setup " << bytes[0] << ", finalized " << bytes[1]
+                   << ", localized ";
+            if (localNumbering) gsInfo << bytes[2]; else gsInfo << "-";
+            gsInfo << ", dense table mapSize()*sizeof(index_t) "
+                   << u.mapper().mapSize() * sizeof(index_t) << "\n";
+        }
+    }
+
+    if (checkMapper)
+    {
+        // Compares every query of the mapper \a s with the dense twin \a d.
+        const auto compare = [&](const gsDofMapper & d, const gsDofMapper & s) -> size_t
+        {
+#define MAPPER_CHECK(cond, what) \
+            GISMO_ENSURE(cond, "mapper check, rank " << rank << ": " << what << " differs from the dense twin")
+            MAPPER_CHECK(gsDofMapper::storage::dense  == d.storageMode(), "storageMode (twin)");
+            MAPPER_CHECK(gsDofMapper::storage::sparse == s.storageMode(), "storageMode");
+            MAPPER_CHECK(d.firstIndex() == s.firstIndex(), "firstIndex");
+            MAPPER_CHECK(d.freeSize() == s.freeSize(), "freeSize");
+            MAPPER_CHECK(d.size() == s.size(), "size");
+            MAPPER_CHECK(d.boundarySize() == s.boundarySize(), "boundarySize");
+            MAPPER_CHECK(d.coupledSize() == s.coupledSize(), "coupledSize");
+            MAPPER_CHECK(d.boundarySizeWithDuplicates() == s.boundarySizeWithDuplicates(),
+                         "boundarySizeWithDuplicates");
+            MAPPER_CHECK(d.getTagged() == s.getTagged(), "getTagged");
+            const auto same = [&](const gsVector<index_t> & x, const gsVector<index_t> & y)
+            { return x.size() == y.size() && (0 == x.size() || x == y); };
+            size_t positions = 0;
+            for (size_t k = 0; k != d.numPatches(); ++k)
+            {
+                const index_t kk = static_cast<index_t>(k);
+                MAPPER_CHECK(d.patchSize(kk) == s.patchSize(kk), "patchSize of patch " << k);
+                for (index_t i = 0; i != static_cast<index_t>(d.patchSize(kk)); ++i)
+                    MAPPER_CHECK(d.index(i, kk) == s.index(i, kk), "index(" << i << "," << k << ")");
+                positions += d.patchSize(kk);
+                MAPPER_CHECK(same(d.findBoundary(kk), s.findBoundary(kk)), "findBoundary of patch " << k);
+                MAPPER_CHECK(same(d.findFree(kk), s.findFree(kk)), "findFree of patch " << k);
+                MAPPER_CHECK(same(d.findFreeUncoupled(kk), s.findFreeUncoupled(kk)),
+                             "findFreeUncoupled of patch " << k);
+                MAPPER_CHECK(same(d.findCoupled(kk, -1), s.findCoupled(kk, -1)),
+                             "findCoupled(" << k << ",-1)");
+                for (size_t j = 0; j != d.numPatches(); ++j)
+                    MAPPER_CHECK(same(d.findCoupled(kk, static_cast<index_t>(j)),
+                                      s.findCoupled(kk, static_cast<index_t>(j))),
+                                 "findCoupled(" << k << "," << j << ")");
+            }
+#undef MAPPER_CHECK
+            return positions;
+        };
+
+        gsDofMapper twin = createMapper(mb, bc, 1, u.id(), /*conforming=*/true,
+                                        /*finalize=*/false, gsDofMapper::storage::dense);
+        twin.finalize();
+        if (localNumbering)
+            twin.localize(localFreeDofs(*myDomain, mb, twin));
+        const size_t positions = compare(twin, u.mapper());
+
+        // every other current free dof: localizes a finalized mapper without
+        // --local and re-localizes with it
+        gsDofMapper a = twin, b = u.mapper();
+        std::vector<index_t> l2;
+        for (index_t g = a.firstIndex(); g < a.firstIndex() + a.freeSize(); g += 2)
+            l2.push_back(g);
+        a.localize(l2);
+        b.localize(l2);
+        compare(a, b);
+
+        if (0 == rank)
+            gsInfo << "mapper check vs dense twin: identical (" << positions
+                   << " positions on rank 0, " << (localNumbering ? 2 : 1)
+                   << (localNumbering ? " localizations)\n" : " localization)\n");
     }
 
     PetscCall( KSPDestroy(&ksp) );

@@ -106,8 +106,15 @@ public:
     /// exactly with the collected pattern. Collective; the sink can be
     /// used once.
     ///
+    /// The checks on rank-local data (stored indices in [0, N), MPI count
+    /// range, received rows owned, matrix layout) are agreed on by all
+    /// ranks before the next collective call: if one fails anywhere, every
+    /// rank throws, instead of the healthy ranks waiting in that call.
+    ///
     /// Time O(E k^2 log k) plus O(number of received pairs); memory
-    /// O(E k) indices, released before the matrix is allocated.
+    /// O(E k) stored indices plus O(r k) pairs for the r stored row indices
+    /// owned by other ranks (worst case O(E k^2)), released before the
+    /// matrix is allocated.
     PetscErrorCode createMatrix(Mat & A)
     {
         PetscFunctionBeginUser;
@@ -126,8 +133,14 @@ public:
         PetscCallMPI( MPI_Allgather(&re, 1, MPIU_INT, ends.data(), 1, MPIU_INT, m_comm) );
 
         const std::size_t numCalls = m_rowOff.size() - 1;
-        GISMO_ENSURE(numCalls < static_cast<std::size_t>(INT_MAX),
-                     "gsPetscPatternSink: too many stored blocks");
+        const bool callsOk = numCalls < static_cast<std::size_t>(INT_MAX);
+        // An index outside [0, N) can only come from a broken perm; a row
+        // index >= N would select the owner ends.size(), out of bounds.
+        bool indicesOk = true;
+        for (std::size_t k = 0; k != m_rowIdx.size(); ++k)
+            indicesOk = indicesOk && m_rowIdx[k] >= 0 && m_rowIdx[k] < m_N;
+        for (std::size_t k = 0; k != m_colIdx.size(); ++k)
+            indicesOk = indicesOk && m_colIdx[k] >= 0 && m_colIdx[k] < m_N;
 
         // Owned rows: calls touching each row (counting sort)
         std::vector<std::size_t> rowPtr;
@@ -169,39 +182,49 @@ public:
         std::sort(pairs.begin(), pairs.end());
         pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
 
+        // MPI counts are int: count in size_t, narrow only after the check
         std::vector<int> sendCnt(size, 0), sendDsp(size, 0), recvCnt(size), recvDsp(size, 0);
         std::vector<PetscInt> sendBuf;
-        sendBuf.reserve(2 * pairs.size());
+        bool sendOk = true;
         {
-            std::size_t tot = 0;
+            std::vector<std::size_t> cnt(size, 0);
+            sendBuf.reserve(2 * pairs.size());
             for (std::size_t q = 0; q != pairs.size(); ++q)
             {
+                if (pairs[q].first < 0 || pairs[q].first >= m_N)
+                    continue; // already flagged by indicesOk
                 const PetscMPIInt dest = static_cast<PetscMPIInt>(
                     std::upper_bound(ends.begin(), ends.end(), pairs[q].first) - ends.begin());
-                sendCnt[dest] += 2;
+                cnt[dest] += 2;
                 sendBuf.push_back(pairs[q].first);
                 sendBuf.push_back(pairs[q].second);
             }
+            std::size_t tot = 0;
             for (PetscMPIInt p = 0; p != size; ++p)
             {
                 sendDsp[p] = static_cast<int>(tot);
-                tot += sendCnt[p];
-                GISMO_ENSURE(tot <= static_cast<std::size_t>(INT_MAX),
-                             "gsPetscPatternSink: pair exchange exceeds the MPI count range");
+                tot += cnt[p];
+                sendOk = sendOk && tot <= static_cast<std::size_t>(INT_MAX);
+                sendCnt[p] = static_cast<int>(cnt[p]);
             }
         }
         std::vector<Pair>().swap(pairs);
+        ensureOnAllRanks(!callsOk   ? "too many stored blocks (> INT_MAX)"
+                       : !indicesOk ? "a stored row or column index is outside [0, N): broken perm?"
+                       : !sendOk    ? "pair exchange exceeds the MPI count range (send)"
+                       : nullptr);
 
         PetscCallMPI( MPI_Alltoall(sendCnt.data(), 1, MPI_INT, recvCnt.data(), 1, MPI_INT, m_comm) );
         {
             std::size_t tot = 0;
+            bool recvOk = true;
             for (PetscMPIInt p = 0; p != size; ++p)
             {
                 recvDsp[p] = static_cast<int>(tot);
                 tot += recvCnt[p];
-                GISMO_ENSURE(tot <= static_cast<std::size_t>(INT_MAX),
-                             "gsPetscPatternSink: pair exchange exceeds the MPI count range");
+                recvOk = recvOk && tot <= static_cast<std::size_t>(INT_MAX);
             }
+            ensureOnAllRanks(recvOk ? nullptr : "pair exchange exceeds the MPI count range (receive)");
         }
         std::size_t totRecv = static_cast<std::size_t>(recvDsp[size - 1]) + recvCnt[size - 1];
         std::vector<PetscInt> recvBuf(totRecv);
@@ -213,12 +236,15 @@ public:
         std::vector<std::size_t> recvPtr;
         recvPtr.reserve(n + 1);
         recvPtr.assign(n + 1, 0);
+        bool ownedOk = true;
         for (std::size_t q = 0; q != totRecv; q += 2)
         {
-            GISMO_ENSURE(recvBuf[q] >= rs && recvBuf[q] < re,
-                         "gsPetscPatternSink: received a row that is not owned");
-            ++recvPtr[recvBuf[q] - rs + 1];
+            if (recvBuf[q] >= rs && recvBuf[q] < re)
+                ++recvPtr[recvBuf[q] - rs + 1];
+            else
+                ownedOk = false;
         }
+        ensureOnAllRanks(ownedOk ? nullptr : "received a row that is not owned");
         for (PetscInt i = 0; i != n; ++i)
             recvPtr[i + 1] += recvPtr[i];
         std::vector<PetscInt> recvCols;
@@ -279,11 +305,32 @@ public:
         PetscCall( MatSetOption(A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE) );
         PetscInt rs2, re2;
         PetscCall( MatGetOwnershipRange(A, &rs2, &re2) );
-        GISMO_ENSURE(rs2 == rs && re2 == re, "gsPetscPatternSink: matrix layout differs from the sink layout");
+        ensureOnAllRanks(rs2 == rs && re2 == re ? nullptr
+                         : "matrix layout differs from the sink layout");
         PetscFunctionReturn(PETSC_SUCCESS);
     }
 
 private:
+    /// Makes a rank-local check collective: \a failure is null on the ranks
+    /// where the check passed. If it is non-null on any rank, that rank
+    /// names it on gsWarn and every rank throws. A plain GISMO_ENSURE would
+    /// throw on the failing ranks only and leave the others waiting in the
+    /// next collective call (under srun they are not killed: the job hangs
+    /// until its time limit). Collective; one MPI_Allreduce of one int.
+    void ensureOnAllRanks(const char * failure) const
+    {
+        int bad = failure ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, m_comm);
+        if (failure)
+        {
+            int r = 0;
+            MPI_Comm_rank(m_comm, &r);
+            gsWarn << "gsPetscPatternSink::createMatrix, rank " << r << ": " << failure << "\n";
+        }
+        GISMO_ENSURE(0 == bad, "gsPetscPatternSink::createMatrix: a check failed on at least "
+                               "one rank, see the warning of that rank");
+    }
+
     MPI_Comm m_comm;
     PetscInt m_N, m_nLocal;
     const gsVector<index_t> * m_perm;
