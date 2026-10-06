@@ -67,11 +67,15 @@
                whole pass A of gsGeometricPartitioner (serial constructor);
                by default pass A is split over the ranks (gsMpiComm
                constructor). The variant gets the suffix "+serialpart"
+      --weight-by-dofs  (needs a geometric --partition) weight every element
+               by its free-DOF count (weighted RCB split / weighted curve cut).
+               The variant gets the suffix "+wdofs"
       --check-partition  (needs a geometric --partition) every rank also builds
                a serial partitioner with the same options and compares labels.
                The parallel labels must be identical on all ranks, otherwise
                all ranks abort together. Differences from the serial labels
-               are printed on rank 0 and are not fatal
+               are printed on rank 0; with rcb they are also fatal (all ranks
+               abort together), with hilbert/morton they are only reported
       --csv    print CSV lines (prefix CSV,) in addition to the table
       -o, --petsc OPTS  PETSc options, replacing the default
                ["-ksp_type cg -pc_type gamg -ksp_rtol 1e-10
@@ -90,10 +94,7 @@
     "...: subdomainForRank"; the solve is "KSP setup (incl. preconditioner)"
     and "KSP solve". With --check-partition an extra stage "partition check
     (not part of the run)" follows the partition stages, and "peak RSS (whole
-    run)" includes its transient. Right after "partition() (centroids +
-    labels)" the "partition() sub: <step> [us]" count entries give the
-    per-rank wall time of every sub-step of the partition, the driver-side
-    total and the untimed residual.
+    run)" includes its transient.
 
     Every stage reports the heap it still holds at its end, VmRSS at its end
     and VmHWM over the stage (transients included). The objects at the top
@@ -129,7 +130,7 @@ int main(int argc, char *argv[])
     bool refineGeometry = false, legacy = false, csv = false, noReserve = false;
     bool lazy = false, sink = false, localNumbering = false, rendezvous = false;
     bool sparseMapper = false, checkMapper = false;
-    bool serialPartition = false, checkPartition = false;
+    bool serialPartition = false, checkPartition = false, weightByDofs = false;
     std::string partition("block");
     std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10"
                           " -pc_gamg_aggressive_square_graph false -pc_gamg_threshold 0.02");
@@ -151,7 +152,8 @@ int main(int argc, char *argv[])
     cmd.addSwitch("sparse-mapper", "Opt-in sparse gsDofMapper storage (gsFeSpace::setMapperStorage)", sparseMapper);
     cmd.addSwitch("check-mapper", "With --sparse-mapper: after the run, compare the mapper with a dense twin built by the same calls (aborts on the first difference)", checkMapper);
     cmd.addSwitch("serial-partition", "Geometric partition: every rank runs the whole pass A (serial gsGeometricPartitioner constructor) instead of splitting it over the ranks", serialPartition);
-    cmd.addSwitch("check-partition", "Geometric partition: also build a serial partitioner on every rank and compare the labels (fatal if they differ across ranks, reported if they differ from serial)", checkPartition);
+    cmd.addSwitch("weight-by-dofs", "Geometric partition: weight each element by its free-DOF count (gsGeometricPartitioner::Options::weightByDofs)", weightByDofs);
+    cmd.addSwitch("check-partition", "Geometric partition: also build a serial partitioner on every rank and compare the labels (fatal if they differ across ranks; fatal if they differ from serial with rcb, only reported with hilbert/morton)", checkPartition);
     cmd.addSwitch("csv", "Print CSV lines (prefix CSV,) in addition to the table", csv);
     cmd.addString("o", "petsc", "PETSc options", petscOpts);
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
@@ -159,6 +161,7 @@ int main(int argc, char *argv[])
     GISMO_ENSURE(!rendezvous || localNumbering, "--rendezvous needs --local");
     GISMO_ENSURE(!checkMapper || sparseMapper, "--check-mapper needs --sparse-mapper");
     GISMO_ENSURE(!checkPartition  || "block" != partition, "--check-partition needs a geometric partition (rcb, hilbert or morton)");
+    GISMO_ENSURE(!weightByDofs || "block" != partition, "--weight-by-dofs needs a geometric partition (rcb, hilbert or morton)");
     GISMO_ENSURE(!serialPartition || "block" != partition, "--serial-partition needs a geometric partition (rcb, hilbert or morton)");
     GISMO_ENSURE(!(localNumbering && legacy), "--legacy needs the global numbering, it cannot be combined with --local");
 
@@ -241,6 +244,7 @@ int main(int argc, char *argv[])
     {
         gsGeometricPartitioner<real_t>::Options popt;
         popt.strategy = gsGeometricPartitioner<real_t>::strategyFromString(partition);
+        popt.weightByDofs = weightByDofs;
         // Pass A is split over the ranks unless --serial-partition. The three
         // sub-stages share the prefix "element partition (<strategy>)"; their
         // sum is the partition cost.
@@ -250,37 +254,8 @@ int main(int argc, char *argv[])
             : new gsGeometricPartitioner<real_t>(mp, mb, u.mapper(), nproc, comm, popt));
         gsGeometricPartitioner<real_t> & part = *partPtr;
         L.stage(pre + "construct (element domain)");
-        const double tPart0 = MPI_Wtime();
         part.partition();
-        const double tPart = MPI_Wtime() - tPart0;
         L.stage(pre + "partition() (centroids + labels)");
-        // TODO: remove these timings once the partition sub-stage costs are known.
-        // Every rank pushes every entry in this order (the ledger reduces by index).
-        {
-            typedef gsGeometricPartitioner<real_t>::Timings Tm;
-            const Tm & tm = part.timings();
-            const std::pair<const char *, double> chain[] = {
-                {"tensorGuard", tm.tensorGuard}, {"setup", tm.setup}, {"bbox", tm.bbox},
-                {"rangeCheck", tm.rangeCheck}, {"sliceJump", tm.sliceJump},
-                {"centroidIter", tm.centroidIter}, {"centroidEval", tm.centroidEval},
-                {"sliceCheck", tm.sliceCheck}, {"gatherPrep", tm.gatherPrep},
-                {"centroidGather", tm.centroidGather}, {"weightGather", tm.weightGather},
-                {"finiteCheck", tm.finiteCheck}, {"labelsAlloc", tm.labelsAlloc},
-                {"rcbOrder", tm.rcbOrder}, {"rcbSplit", tm.rcbSplit},
-                {"curveSetup", tm.curveSetup}, {"curveKeys", tm.curveKeys},
-                {"curveSort", tm.curveSort}, {"curveCut", tm.curveCut},
-                {"setLabels", tm.setLabels}, {"release", tm.release}};
-            const std::string sub = pre + "partition() sub: ";
-            L.count(sub + "total (driver) [us]", std::llround(1e6 * tPart));
-            L.count(sub + "computeLabelsTotal [us]", std::llround(1e6 * tm.computeLabelsTotal));
-            double sum = 0;
-            for (const std::pair<const char *, double> & c : chain)
-            {
-                L.count(sub + c.first + " [us]", std::llround(1e6 * c.second));
-                sum += c.second;
-            }
-            L.count(sub + "residual [us]", std::llround(1e6 * (tPart - sum)));
-        }
         myDomain = part.subdomainForRank(rank, nproc);
         L.stage(pre + "subdomainForRank");
         if (checkPartition)
@@ -328,6 +303,12 @@ int main(int argc, char *argv[])
                     gsInfo << "partition check: labels identical across ranks; parallel vs serial: "
                            << diff << " of " << nElem << " elements differ\n";
             }
+            // Only rcb is required to match the serial labels bit for bit; the
+            // curve keys depend on the rounding of the centroids, which the
+            // chunked parallel evaluation does not guarantee to reproduce.
+            GISMO_ENSURE(!(popt.strategy == gsGeometricPartitioner<real_t>::rcb && 0 != diff),
+                         "partition check: --partition rcb requires parallel and serial labels to be identical, but "
+                         << diff << " of " << nElem << " elements differ");
             L.stage("partition check (not part of the run)");
         }
         if (!rendezvous)
@@ -537,6 +518,7 @@ int main(int argc, char *argv[])
 
     std::string variant = partition;
     if (serialPartition) variant += "+serialpart";
+    if (weightByDofs) variant += "+wdofs";
     if (noReserve) variant += "+noreserve";
     if (lazy)      variant += "+lazy";
     if (localNumbering) variant += "+local";
