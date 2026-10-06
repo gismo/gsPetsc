@@ -86,7 +86,10 @@
     "...: subdomainForRank"; the solve is "KSP setup (incl. preconditioner)"
     and "KSP solve". With --check-partition an extra stage "partition check
     (not part of the run)" follows the partition stages, and "peak RSS (whole
-    run)" includes its transient.
+    run)" includes its transient. Right after "partition() (centroids +
+    labels)" the "partition() sub: <step> [us]" count entries give the
+    per-rank wall time of every sub-step of the partition, the driver-side
+    total and the untimed residual.
 
     Every stage reports the heap it still holds at its end, VmRSS at its end
     and VmHWM over the stage (transients included). The objects at the top
@@ -105,6 +108,7 @@
 */
 
 #include <gismo.h>
+#include <cmath>
 #include <gsPetsc/partitioned/gsElementRangeDomain.h>
 #include <gsPetsc/partitioned/gsMemoryProbe.h>
 #include <gsPetsc/partitioned/gsPetscCOO.h>
@@ -241,8 +245,37 @@ int main(int argc, char *argv[])
             : new gsGeometricPartitioner<real_t>(mp, mb, u.mapper(), nproc, comm, popt));
         gsGeometricPartitioner<real_t> & part = *partPtr;
         L.stage(pre + "construct (element domain)");
+        const double tPart0 = MPI_Wtime();
         part.partition();
+        const double tPart = MPI_Wtime() - tPart0;
         L.stage(pre + "partition() (centroids + labels)");
+        // TODO: remove these timings once the partition sub-stage costs are known.
+        // Every rank pushes every entry in this order (the ledger reduces by index).
+        {
+            typedef gsGeometricPartitioner<real_t>::Timings Tm;
+            const Tm & tm = part.timings();
+            const std::pair<const char *, double> chain[] = {
+                {"tensorGuard", tm.tensorGuard}, {"setup", tm.setup}, {"bbox", tm.bbox},
+                {"rangeCheck", tm.rangeCheck}, {"sliceJump", tm.sliceJump},
+                {"centroidIter", tm.centroidIter}, {"centroidEval", tm.centroidEval},
+                {"sliceCheck", tm.sliceCheck}, {"gatherPrep", tm.gatherPrep},
+                {"centroidGather", tm.centroidGather}, {"weightGather", tm.weightGather},
+                {"finiteCheck", tm.finiteCheck}, {"labelsAlloc", tm.labelsAlloc},
+                {"rcbOrder", tm.rcbOrder}, {"rcbSplit", tm.rcbSplit},
+                {"curveSetup", tm.curveSetup}, {"curveKeys", tm.curveKeys},
+                {"curveSort", tm.curveSort}, {"curveCut", tm.curveCut},
+                {"setLabels", tm.setLabels}, {"release", tm.release}};
+            const std::string sub = pre + "partition() sub: ";
+            L.count(sub + "total (driver) [us]", std::llround(1e6 * tPart));
+            L.count(sub + "computeLabelsTotal [us]", std::llround(1e6 * tm.computeLabelsTotal));
+            double sum = 0;
+            for (const std::pair<const char *, double> & c : chain)
+            {
+                L.count(sub + c.first + " [us]", std::llround(1e6 * c.second));
+                sum += c.second;
+            }
+            L.count(sub + "residual [us]", std::llround(1e6 * (tPart - sum)));
+        }
         myDomain = part.subdomainForRank(rank, nproc);
         L.stage(pre + "subdomainForRank");
         if (checkPartition)
