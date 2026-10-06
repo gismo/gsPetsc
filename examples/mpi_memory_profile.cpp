@@ -73,8 +73,12 @@
                all ranks abort together. Differences from the serial labels
                are printed on rank 0 and are not fatal
       --csv    print CSV lines (prefix CSV,) in addition to the table
-      -o, --petsc OPTS  PETSc options
-               ["-ksp_type cg -pc_type gamg -ksp_rtol 1e-10"]
+      -o, --petsc OPTS  PETSc options, replacing the default
+               ["-ksp_type cg -pc_type gamg -ksp_rtol 1e-10
+                 -pc_gamg_aggressive_square_graph false -pc_gamg_threshold 0.02"]
+               MIS-2 coarsening instead of graph squaring, plus a strength
+               threshold, about halves the GAMG setup memory for p = 2 in 3D
+               at an unchanged setup + solve time.
 
     Ledger stages on the --sink path:
     "localize mapper (local -> global rows)" (with --local),
@@ -127,7 +131,8 @@ int main(int argc, char *argv[])
     bool sparseMapper = false, checkMapper = false;
     bool serialPartition = false, checkPartition = false;
     std::string partition("block");
-    std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10");
+    std::string petscOpts("-ksp_type cg -pc_type gamg -ksp_rtol 1e-10"
+                          " -pc_gamg_aggressive_square_graph false -pc_gamg_threshold 0.02");
 
     gsCmdLine cmd("Memory profile of element-partitioned assembly with gsExprAssembler + PETSc.");
     cmd.addInt   ("d", "dim",     "Spatial dimension (2 or 3)", dim);
