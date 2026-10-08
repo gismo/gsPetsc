@@ -23,6 +23,16 @@ mpirun -np 4 ./bin/mpi_memory_profile -d 2 -r 9 [--legacy] [--noreserve] [--geo]
 `--legacy` excludes `--sink` and `--local`, `--rendezvous` needs `--local`, and `--check-mapper`
 needs `--sparse-mapper`. `--serial-partition` and `--check-partition` need a geometric `--partition`.
 
+With more than one rank, a geometric `--partition` runs the parallel (`gsMpiComm`) constructor of
+`gsGeometricPartitioner` by default. That object is distributed: each rank keeps only the sorted ids of
+its own elements, and its dof numbering is rendezvous-only, because `makeDofMapper()` (pass B, the
+`gsPartitionedDofMapper` ownership) works only with the serial constructor. So such a run needs
+`--local --rendezvous`, or `--serial-partition`, which selects the serial constructor. Without either, the
+driver aborts with a `GISMO_ENSURE`. `gatherLabels()` is collective and builds all N labels on every rank,
+so it is for diagnostics only. `--check-partition` calls it and compares the gathered labels with those
+of a serial partitioner built on every rank. This is not a coverage or disjointness check of the
+per-rank lists.
+
 ### Ledger output (`--csv`)
 
 One line per measurement, written by rank 0, values reduced over ranks:
@@ -227,7 +237,8 @@ template<class Sink, class... expr> void computePattern_into(Sink & sink, const 
 
 Variants of `mpi_memory_profile` (all give identical L2 errors):
 `block` (element block partition, PETSc equal split), `lazy` (`lazyMatrix`),
-`rcb` (`gsGeometricPartitioner` + `gsPartitionedDofMapper` ownership),
+`rcb` (`gsGeometricPartitioner` + `gsPartitionedDofMapper` ownership; this is pass B, which on more than one
+rank works only with the serial constructor, i.e. with `--serial-partition`),
 `sink` (`computePattern_into` into `gsPetscPatternSink`, `assemble_into` into `gsPetscSystemSink` with `MatSetValues`).
 
 Peak RSS per rank, P = 4:
@@ -239,6 +250,9 @@ Peak RSS per rank, P = 4:
 
 The peak RSS tables in this section were measured when the pattern stage was still based on
 PETSc's `MATPREALLOCATOR`.
+
+The `rcb` columns and the rcb lines below were measured with the replicated partitioner and the
+`gsPartitionedDofMapper` ownership, a configuration that needs `--serial-partition` on several ranks.
 
 rcb+sink, 2D N = 1.05 M, peak RSS per rank for P = 1/2/4/8: 1467 / 846 / 450 / 251 MiB.
 rcb+sink, 2D N = 4.2 M, P = 4: 1671 MiB per rank. With the default `initSystem` reservation, the same run was OOM-killed.
@@ -253,7 +267,7 @@ entries, causing 161 MiB of PETSc stash per rank. With rcb it is 6 % (20 MiB of 
 | `gsDofMapper`, dense storage (the default) | 4 | whole run |
 | `gsDofMapper`, sparse storage (opt-in) | O(marked positions), not O(N): `nBytes()` 43 732 B after `localize`, max over ranks (2D, p = 2, r = 9, P = 4, rcb; dense 4 227 608 B); a container-capacity estimate, not a heap measurement | whole run |
 | permutation (`gsPartitionedDofMapper::permutation()`) | 4 | whole run |
-| partitioner labels/weights + ownership tables | ~20 | transient (partitioning) |
+| partitioner labels/weights + ownership tables (this row is the serial constructor and pass B; the distributed parallel constructor holds only the own sorted element ids, and its partition-stage peak-RSS increment is about 55 B per own element on one rank, not per global dof; case and build under "What still grows with the global size on every rank") | ~20 | transient (partitioning) |
 | full solution vector for `gsFeSolution` (+ unpermuted copy) | 8 (+8) | post-processing |
 | solution `gsMultiPatch` (`extract`) | 8 | optional |
 | `lazy` without sink: fiber pointers + `m_rhs` | 16 | assembly |
@@ -378,6 +392,10 @@ Peak RSS per rank [MiB]:
 | rcb+local+rendezvous+sink | 417 | 445 | 448 | 1609 | 1717 | 1755 |
 | block+local+rendezvous+sink | 416 | 444 | 447 | 1608 | 1812 | 1826 |
 
+The `rcb+sink` row was measured with the replicated partitioner and `gsPartitionedDofMapper` ownership. On
+more than one rank that configuration needs `--serial-partition`; the default parallel constructor needs
+`--local --rendezvous`, as in the `rcb+local+rendezvous+sink` row.
+
 Stage wall time [s], rcb+local+rendezvous+sink:
 
 | stage | 2D P=1 | 2 | 4 | 3D P=1 | 2 | 4 |
@@ -393,7 +411,14 @@ What still grows with the global size on every rank:
 
 - `gsDofMapper`: 1 → 2 → 4 MiB in 2D, i.e. 4 B per global dof with the default dense storage.
   Sparse storage is O(marked positions) and does not grow with N this way.
-- RCB labels and weights: 3 → 5 → 9 MiB while partitioning, plus O(N) time on every rank.
+- RCB labels and weights: 3 → 5 → 9 MiB while partitioning, plus O(N) time on every rank. This is the
+  replicated partitioner as measured in the run above. With the distributed parallel constructor
+  (`comm.size() > 1`) each rank holds only the sorted ids of its own elements, and the partition stage
+  needs O(N/P) memory (plus O(P·256) select rows and the own ids) and O(N/P) element visits per rank.
+  The geometry, the multibasis and the dense `gsDofMapper` stay replicated. Measured once, in the local RelWithDebInfo build with asserts (case
+  `-d 2 -r 8 -a 4 --partition rcb --local --rendezvous --sink --sparse-mapper`, 1048576 elements): the
+  peak-RSS increment of the partition stage is about 55 B per own element (55.4 B at np 2, 54.5 B at
+  np 4), and it halves from np 2 to np 4, i.e. it is slice data and not an O(N) remnant.
   The block partition with rendezvous ownership avoids the partitioner entirely.
   In 3D it has more ghost dofs and more stash than RCB.
 - `localize`: one pass over the global mapper with dense storage. With sparse storage no loop runs

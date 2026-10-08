@@ -37,9 +37,9 @@
       -a, --aspect A  multiply the patches in the last direction by A
                (weak scaling) [1]
       --partition block|rcb|hilbert|morton  element partition [block]; the
-               geometric ones use gsGeometricPartitioner and the dof
-               ownership of gsPartitionedDofMapper (PETSc rows aligned with
-               the elements)
+               geometric ones use gsGeometricPartitioner. Dof ownership:
+               rendezvous with --rendezvous, else gsPartitionedDofMapper
+               (pass B), which on several ranks needs --serial-partition
       --geo    refine the geometry together with the basis
       --legacy also measure the conversion path of PETScSupport.h (global
                gsSparseMatrix + RowMajor copy); excludes --sink and --local
@@ -49,7 +49,9 @@
                matrix, rhs and solution, no global vector on any rank
       --rendezvous  (needs --local) dof ownership and rows by a distributed
                rendezvous: lowest touching rank owns a dof, no global
-               tables (gsPartitionedDofMapper is not built)
+               tables (gsPartitionedDofMapper is not built). Required with
+               a geometric --partition on more than one rank, unless
+               --serial-partition
       --sink   assemble directly into PETSc (no gismo-side matrix or rhs):
                computePattern_into with gsPetscPatternSink (exact AIJ
                preallocation), assemble_into with gsPetscSystemSink
@@ -66,15 +68,17 @@
       --serial-partition  (needs a geometric --partition) every rank runs the
                whole pass A of gsGeometricPartitioner (serial constructor);
                by default pass A is split over the ranks (gsMpiComm
-               constructor). The variant gets the suffix "+serialpart"
+               constructor), which needs --rendezvous when the run has more
+               than one rank. The variant gets the suffix "+serialpart"
       --weight-by-dofs  (needs a geometric --partition) weight every element
                by its free-DOF count (weighted RCB split / weighted curve cut).
                The variant gets the suffix "+wdofs"
-      --check-partition  (needs a geometric --partition) every rank also builds
-               a serial partitioner with the same options and compares labels.
-               The parallel labels must be identical on all ranks, otherwise
-               all ranks abort together. Differences from the serial labels
-               are printed on rank 0; with rcb they are also fatal (all ranks
+      --check-partition  (needs a geometric --partition) every rank gathers the
+               parallel labels with gatherLabels() and also builds a serial
+               partitioner with the same options and compares labels.
+               Distributed ctor: parallel vs serial is the real check; with
+               --serial-partition, across-rank agreement is. Differences are
+               printed on rank 0; with rcb they are also fatal (all ranks
                abort together), with hilbert/morton they are only reported
       --csv    print CSV lines (prefix CSV,) in addition to the table
       -o, --petsc OPTS  PETSc options, replacing the default
@@ -109,7 +113,7 @@
     with -o are inserted after initialization.
 
     Example run:
-    mpirun -np 4 ./bin/mpi_memory_profile -r 7 -p 2 -s 1 --partition rcb --sink
+    mpirun -np 4 ./bin/mpi_memory_profile -r 7 -p 2 -s 1 --partition rcb --local --rendezvous --sink
 */
 
 #include <gismo.h>
@@ -147,13 +151,13 @@ int main(int argc, char *argv[])
     cmd.addSwitch("noreserve", "Do not reserve fiber storage in initSystem (bdA=bdB=bdO=0)", noReserve);
     cmd.addSwitch("lazy", "Allocate fibers on first use (option lazyMatrix)", lazy);
     cmd.addSwitch("local", "Rank-local dof numbering (localized mapper)", localNumbering);
-    cmd.addSwitch("rendezvous", "Distributed dof ownership/rows (needs --local)", rendezvous);
+    cmd.addSwitch("rendezvous", "Distributed dof ownership/rows (needs --local; required with a geometric partition on several ranks unless --serial-partition)", rendezvous);
     cmd.addSwitch("sink", "Assemble directly into PETSc (no gismo matrix/rhs)", sink);
     cmd.addSwitch("sparse-mapper", "Opt-in sparse gsDofMapper storage (gsFeSpace::setMapperStorage)", sparseMapper);
     cmd.addSwitch("check-mapper", "With --sparse-mapper: after the run, compare the mapper with a dense twin built by the same calls (aborts on the first difference)", checkMapper);
-    cmd.addSwitch("serial-partition", "Geometric partition: every rank runs the whole pass A (serial gsGeometricPartitioner constructor) instead of splitting it over the ranks", serialPartition);
+    cmd.addSwitch("serial-partition", "Geometric partition: every rank runs the whole pass A (serial gsGeometricPartitioner constructor) instead of splitting it over the ranks (the default parallel constructor needs --rendezvous on several ranks)", serialPartition);
     cmd.addSwitch("weight-by-dofs", "Geometric partition: weight each element by its free-DOF count (gsGeometricPartitioner::Options::weightByDofs)", weightByDofs);
-    cmd.addSwitch("check-partition", "Geometric partition: also build a serial partitioner on every rank and compare the labels (fatal if they differ across ranks; fatal if they differ from serial with rcb, only reported with hilbert/morton)", checkPartition);
+    cmd.addSwitch("check-partition", "Geometric partition: gather the parallel labels (gatherLabels) and compare them with those of a serial partitioner on every rank (fatal if they differ across ranks; fatal if they differ from serial with rcb, only reported with hilbert/morton)", checkPartition);
     cmd.addSwitch("csv", "Print CSV lines (prefix CSV,) in addition to the table", csv);
     cmd.addString("o", "petsc", "PETSc options", petscOpts);
     try { cmd.getValues(argc,argv); } catch (int rv) { return rv; }
@@ -168,6 +172,11 @@ int main(int argc, char *argv[])
     const gsMpi & mpi = gsMpi::init(argc, argv);
     gsMpiComm comm = mpi.worldComm();
     const int rank = comm.rank(), nproc = comm.size();
+    // Pass B (makeDofMapper) is serial-only, so the parallel partitioner can
+    // only be used without --rendezvous when there is a single rank.
+    GISMO_ENSURE(!("block" != partition && !serialPartition && nproc > 1 && !rendezvous),
+                 "--partition " << partition << " with the parallel partitioner on " << nproc
+                 << " ranks needs --rendezvous (with --local): its dof numbering (makeDofMapper) is serial-only; use --local --rendezvous, or --serial-partition");
     const long long rssAfterMpi = memprobe::rssBytes();
     PetscCall( PetscInitializeNoArguments() );
     PetscCall( PetscOptionsInsertString(NULL, petscOpts.c_str()) );
@@ -261,26 +270,29 @@ int main(int argc, char *argv[])
         if (checkPartition)
         {
             // Cost: one extra serial partition (pass A O(N) plus labelling,
-            // RCB O(N log P), curves O(N log N)) and O(N) hashing/comparison
+            // RCB O(N log P), curves O(N log N)), the gather of the parallel
+            // labels (an O(N) buffer per rank) and O(N) hashing/comparison
             // for N elements. Run in its own stage so that none of it is
-            // charged to the partition stages.
+            // charged to the partition stages. gatherLabels() is collective:
+            // every rank calls it exactly once.
+            const std::vector<index_t> pl = part.gatherLabels();
             long long diff = 0;
-            const long long nElem = static_cast<long long>(part.labels().size());
+            const long long nElem = static_cast<long long>(pl.size());
             {
                 gsGeometricPartitioner<real_t> ser(mp, mb, u.mapper(), nproc, popt);
                 ser.partition();
 
                 // FNV-1a over the labels in element order (order-sensitive)
                 std::uint64_t h = 14695981039346656037ull;
-                for (index_t l : part.labels())
+                for (index_t l : pl)
                 {
                     h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(l));
                     h *= 1099511628211ull;
                 }
                 // The verdict is evaluated on every rank after the reductions,
                 // so all ranks throw together or none does.
-                const bool sizeMismatch = (ser.labels().size() != part.labels().size());
-                std::uint64_t mn[3] = { h, static_cast<std::uint64_t>(part.labels().size()),
+                const bool sizeMismatch = (ser.labels().size() != pl.size());
+                std::uint64_t mn[3] = { h, static_cast<std::uint64_t>(pl.size()),
                                         static_cast<std::uint64_t>(sizeMismatch) };
                 std::uint64_t mx[3] = { mn[0], mn[1], mn[2] };
                 MPI_Allreduce(MPI_IN_PLACE, mn, 3, MPI_UINT64_T, MPI_MIN, comm);
@@ -290,8 +302,8 @@ int main(int argc, char *argv[])
                 GISMO_ENSURE(0 == mx[2],
                              "partition check: the serial and parallel partitions have different element counts");
 
-                for (std::size_t e = 0; e < part.labels().size(); ++e)
-                    if (part.labels()[e] != ser.labels()[e])
+                for (std::size_t e = 0; e < pl.size(); ++e)
+                    if (pl[e] != ser.labels()[e])
                         ++diff;
                 MPI_Allreduce(MPI_IN_PLACE, &diff, 1, MPI_LONG_LONG, MPI_MAX, comm);
             }
